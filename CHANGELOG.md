@@ -5,6 +5,26 @@ All notable changes to rtk (Rust Token Killer) will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.2](https://github.com/rtk-ai/rtk/compare/v0.34.1...v0.34.2) (2026-03-30)
+
+
+### Bug Fixes
+
+* **emots:** replace 📊 with "Summary:" ([495a152](https://github.com/rtk-ai/rtk/commit/495a152059feabc7b516b96e804757608b87a10a))
+* **refacto-codebase:** technical docs & sub folders ([927daef](https://github.com/rtk-ai/rtk/commit/927daef49b8f771d195201d196378e27e0ee8a2b))
+
+## [0.34.1](https://github.com/rtk-ai/rtk/compare/v0.34.0...v0.34.1) (2026-03-28)
+
+
+### Bug Fixes
+
+* **security:** missing toml pkg ([51f9c88](https://github.com/rtk-ai/rtk/commit/51f9c888b81169309df92f7fa3a6f705d44adcab))
+* **security:** salt device hash for telemetry ([32fdbbb](https://github.com/rtk-ai/rtk/commit/32fdbbbb6923c70d343fab14b4b0ce70424e610f))
+* **security:** set 0600 permissions on salt file ([5eae11d](https://github.com/rtk-ai/rtk/commit/5eae11d16410dc4ff26e97672e5367b14efaab76))
+* **telemetry:** cache salt in-process ([22dc059](https://github.com/rtk-ai/rtk/commit/22dc059310b0408adedc2d1228de339e16ea6c0a))
+* **telemetry:** docs + real info from "rtk init -g" ([33195cc](https://github.com/rtk-ai/rtk/commit/33195cc686318ddcca54edfdd1215bd9fd28f891))
+* **telemetry:** hash + salt ([92996b1](https://github.com/rtk-ai/rtk/commit/92996b127257eae16d3e17179592b2899f19254f))
+
 ## [0.34.0](https://github.com/rtk-ai/rtk/compare/v0.33.1...v0.34.0) (2026-03-26)
 
 
@@ -29,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+* **wc:** `wc` filter was never invoked by the hook — removed `"wc "` from `IGNORED_PREFIXES` and added registry entry so `wc` commands are rewritten to `rtk wc`
 * **diff:** correct truncation overflow count in condense_unified_diff ([#833](https://github.com/rtk-ai/rtk/pull/833)) ([5399f83](https://github.com/rtk-ai/rtk/commit/5399f83))
 * **git:** replace vague truncation markers with exact counts in log and grep output ([#833](https://github.com/rtk-ai/rtk/pull/833)) ([185fb97](https://github.com/rtk-ai/rtk/commit/185fb97))
 
@@ -241,6 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+* **cargo clippy:** include actionable error details in compact output instead of summary-only counts ([#602](https://github.com/rtk-ai/rtk/issues/602))
 * **curl:** skip JSON schema replacement when schema is larger than original payload ([#297](https://github.com/rtk-ai/rtk/issues/297))
 * **toml-dsl:** fix regex overmatch on `tofu-plan/init/validate/fmt` and `mix-format/compile` — add `(\s|$)` word boundary to prevent matching subcommands (e.g. `tofu planet`, `mix formats`) ([#349](https://github.com/rtk-ai/rtk/issues/349))
 * **toml-dsl:** remove 3 dead built-in filters (`docker-inspect`, `docker-compose-ps`, `pnpm-build`) — Clap routes these commands before `run_fallback`, so the TOML filters never fire ([#351](https://github.com/rtk-ai/rtk/issues/351))
