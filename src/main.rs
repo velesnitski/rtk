@@ -15,13 +15,13 @@ use cmds::js::{
     lint_cmd, next_cmd, npm_cmd, playwright_cmd, pnpm_cmd, prettier_cmd, prisma_cmd, tsc_cmd,
     vitest_cmd,
 };
-use cmds::jvm::gradlew_cmd;
+use cmds::jvm::{gradlew_cmd, mvn_cmd};
 use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::system::{
-    deps, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
-    read, summary, tree, wc_cmd,
+    deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd, read, search,
+    summary, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -45,6 +45,8 @@ pub enum AgentTarget {
     Kilocode,
     /// Google Antigravity
     Antigravity,
+    /// Pi coding agent
+    Pi,
     /// Hermes CLI
     Hermes,
 }
@@ -60,8 +62,8 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Verbosity level (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    /// Verbosity level (-v, -vv, -vvv) — only recognized before the subcommand
+    #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
     /// Ultra-compact mode: ASCII icons, inline format (Level 2 optimizations)
@@ -242,14 +244,11 @@ enum Commands {
         path: PathBuf,
     },
 
-    /// Show environment variables (filtered, sensitive masked)
+    /// Show environment variables (filtered)
     Env {
         /// Filter by name (e.g. PATH, AWS)
         #[arg(short, long)]
         filter: Option<String>,
-        /// Show all (include sensitive)
-        #[arg(long)]
-        show_all: bool,
     },
 
     /// Find files with compact tree output (accepts native find flags like -name, -type)
@@ -291,6 +290,12 @@ enum Commands {
         command: KubectlCommands,
     },
 
+    /// OpenShift CLI (oc) commands with compact output
+    Oc {
+        #[command(subcommand)]
+        command: OcCommands,
+    },
+
     /// Run command and show heuristic summary
     Summary {
         /// Command to run and summarize
@@ -300,11 +305,6 @@ enum Commands {
 
     /// Compact grep - strips whitespace, truncates, groups by file
     Grep {
-        /// Pattern to search
-        pattern: String,
-        /// Path to search in
-        #[arg(default_value = ".")]
-        path: String,
         /// Max line length
         #[arg(short = 'l', long, default_value = "80")]
         max_len: usize,
@@ -317,10 +317,14 @@ enum Commands {
         /// Filter by file type (e.g., ts, py, rust)
         #[arg(short = 't', long)]
         file_type: Option<String>,
-        /// Show line numbers (always on, accepted for grep/rg compatibility)
-        #[arg(short = 'n', long)]
-        line_numbers: bool,
-        /// Extra ripgrep arguments (e.g., -i, -A 3, -w, --glob)
+        /// Pattern, path, and any grep/rg flags (e.g. -v, -i, -A 3, --glob, --version)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+
+    /// Compact ripgrep - runs rg natively, same output filter as grep
+    Rg {
+        /// Pattern, path, and any rg flags (e.g. -v, -i, -t rust, --glob)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -374,7 +378,6 @@ enum Commands {
         /// Install GitHub Copilot integration (VS Code + CLI)
         #[arg(long)]
         copilot: bool,
-
         /// Preview changes without writing any files (combine with -v to show content)
         #[arg(long = "dry-run", conflicts_with = "show")]
         dry_run: bool,
@@ -735,6 +738,14 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Apache Maven wrapper with compact output (test, integration-test, compile, package, install, verify, deploy)
+    #[command(name = "mvn")]
+    Mvn {
+        /// Maven goals and arguments (e.g., clean install, -DskipTests test, -X)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Show hook rewrite audit metrics (requires RTK_HOOK_AUDIT=1)
     #[command(name = "hook-audit")]
     HookAudit {
@@ -903,7 +914,10 @@ enum PnpmCommands {
 #[derive(Debug, Subcommand)]
 enum DockerCommands {
     /// List running containers
-    Ps,
+    Ps {
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
     /// List images
     Images,
     /// Show container logs (deduplicated)
@@ -921,11 +935,17 @@ enum DockerCommands {
 #[derive(Debug, Subcommand)]
 enum ComposeCommands {
     /// List compose services (compact)
-    Ps,
+    Ps {
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
     /// Show compose logs (deduplicated)
     Logs {
         /// Optional service name
         service: Option<String>,
+        /// Number of log lines to fetch
+        #[arg(long, default_value_t = 100)]
+        tail: u32,
     },
     /// Build compose services (summary)
     Build {
@@ -939,6 +959,12 @@ enum ComposeCommands {
 
 #[derive(Debug, Subcommand)]
 enum KubectlCommands {
+    /// Get Kubernetes resources (compact for pods/services)
+    Get {
+        /// kubectl get arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// List pods
     Pods {
         #[arg(short, long)]
@@ -962,6 +988,41 @@ enum KubectlCommands {
         container: Option<String>,
     },
     /// Passthrough: runs any unsupported kubectl subcommand directly
+    #[command(external_subcommand)]
+    Other(Vec<OsString>),
+}
+
+#[derive(Debug, Subcommand)]
+enum OcCommands {
+    /// Get OpenShift resources (compact for pods/services)
+    Get {
+        /// oc get arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// List pods
+    Pods {
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// All namespaces
+        #[arg(short = 'A', long)]
+        all: bool,
+    },
+    /// List services
+    Services {
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// All namespaces
+        #[arg(short = 'A', long)]
+        all: bool,
+    },
+    /// Show pod logs (deduplicated)
+    Logs {
+        pod: String,
+        #[arg(short, long)]
+        container: Option<String>,
+    },
+    /// Passthrough: runs any unsupported oc subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
 }
@@ -1109,6 +1170,7 @@ enum GoCommands {
 
 /// RTK-only subcommands that should never fall back to raw execution.
 /// If Clap fails to parse these, show the Clap error directly.
+/// When adding a new RTK-only subcommand to `Commands`, add its clap name here.
 const RTK_META_COMMANDS: &[&str] = &[
     "gain",
     "discover",
@@ -1126,6 +1188,10 @@ const RTK_META_COMMANDS: &[&str] = &[
     "untrust",
     "session",
     "rewrite",
+    "telemetry",
+    "smart",
+    "deps",
+    "json",
 ];
 
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
@@ -1206,16 +1272,14 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
                 };
 
                 let filtered = core::toml_filter::apply_filter(filter, &combined_raw);
-                println!("{}", filtered);
-                if let Some(hint) = tee_hint {
-                    println!("{}", hint);
-                }
+                let shown =
+                    core::runner::emit_guarded(&filtered, tee_hint.as_deref(), &combined_raw);
 
                 timer.track(
                     &raw_command,
                     &format!("rtk:toml {}", raw_command),
                     &combined_raw,
-                    &filtered,
+                    &shown,
                 );
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
 
@@ -1298,6 +1362,26 @@ fn shell_split(input: &str) -> Vec<String> {
     discover::lexer::shell_split(input)
 }
 
+fn build_k8s_namespace_args(namespace: Option<String>, all: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if all {
+        args.push("-A".to_string());
+    } else if let Some(n) = namespace {
+        args.push("-n".to_string());
+        args.push(n);
+    }
+    args
+}
+
+fn build_k8s_logs_args(pod: String, container: Option<String>) -> Vec<String> {
+    let mut args = vec![pod];
+    if let Some(cont) = container {
+        args.push("-c".to_string());
+        args.push(cont);
+    }
+    args
+}
+
 /// Merge pnpm global filters args with other ones for standard String-based commands
 fn merge_pnpm_args(filters: &[String], args: &[String]) -> Vec<String> {
     filters
@@ -1340,6 +1424,17 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
 }
 
 fn main() {
+    // Reset SIGPIPE to default handler so writing to a closed pipe
+    // e.g `rtk git log | head` exits silently instead of panicking.
+    // Rust ignores SIGPIPE by default and with panic="abort" in the
+    // release profile that becomes SIGABRT + coredump.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    // nosemgrep: unsafe-block
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let code = match run_cli() {
         Ok(code) => code,
         Err(e) => {
@@ -1361,13 +1456,14 @@ fn uninstall_init_dispatch<UninstallHermes, UninstallStandard>(
 ) -> Result<()>
 where
     UninstallHermes: FnOnce(hooks::init::InitContext) -> Result<()>,
-    UninstallStandard: FnOnce(bool, bool, bool, bool, hooks::init::InitContext) -> Result<()>,
+    UninstallStandard: FnOnce(bool, bool, bool, bool, bool, hooks::init::InitContext) -> Result<()>,
 {
     if agent == Some(AgentTarget::Hermes) {
         uninstall_hermes(ctx)
     } else {
         let cursor = agent == Some(AgentTarget::Cursor);
-        uninstall_standard(global, gemini, codex, cursor, ctx)
+        let pi = agent == Some(AgentTarget::Pi);
+        uninstall_standard(global, gemini, codex, cursor, pi, ctx)
     }
 }
 
@@ -1659,8 +1755,8 @@ fn run_cli() -> Result<i32> {
             0
         }
 
-        Commands::Env { filter, show_all } => {
-            env_cmd::run(filter.as_deref(), show_all, cli.verbose)?;
+        Commands::Env { filter } => {
+            env_cmd::run(filter.as_deref(), cli.verbose)?;
             0
         }
 
@@ -1671,11 +1767,11 @@ fn run_cli() -> Result<i32> {
 
         Commands::Diff { file1, file2 } => {
             if let Some(f2) = file2 {
-                diff_cmd::run(&file1, &f2, cli.verbose)?;
+                diff_cmd::run(&file1, &f2, cli.verbose)?
             } else {
                 diff_cmd::run_stdin(cli.verbose)?;
+                0
             }
-            0
         }
 
         Commands::Log { file } => {
@@ -1696,8 +1792,13 @@ fn run_cli() -> Result<i32> {
         },
 
         Commands::Docker { command } => match command {
-            DockerCommands::Ps => {
-                container::run(container::ContainerCmd::DockerPs, &[], cli.verbose)?
+            DockerCommands::Ps { all } => {
+                let cmd = if all {
+                    container::ContainerCmd::DockerPsAll
+                } else {
+                    container::ContainerCmd::DockerPs
+                };
+                container::run(cmd, &[], cli.verbose)?
             }
             DockerCommands::Images => {
                 container::run(container::ContainerCmd::DockerImages, &[], cli.verbose)?
@@ -1706,9 +1807,9 @@ fn run_cli() -> Result<i32> {
                 container::run(container::ContainerCmd::DockerLogs, &[c], cli.verbose)?
             }
             DockerCommands::Compose { command: compose } => match compose {
-                ComposeCommands::Ps => container::run_compose_ps(cli.verbose)?,
-                ComposeCommands::Logs { service } => {
-                    container::run_compose_logs(service.as_deref(), cli.verbose)?
+                ComposeCommands::Ps { all } => container::run_compose_ps(all, cli.verbose)?,
+                ComposeCommands::Logs { service, tail } => {
+                    container::run_compose_logs(service.as_deref(), tail, cli.verbose)?
                 }
                 ComposeCommands::Build { service } => {
                     container::run_compose_build(service.as_deref(), cli.verbose)?
@@ -1721,35 +1822,37 @@ fn run_cli() -> Result<i32> {
         },
 
         Commands::Kubectl { command } => match command {
+            KubectlCommands::Get { args } => container::run_kubectl_get(&args, cli.verbose)?,
             KubectlCommands::Pods { namespace, all } => {
-                let mut args: Vec<String> = Vec::new();
-                if all {
-                    args.push("-A".to_string());
-                } else if let Some(n) = namespace {
-                    args.push("-n".to_string());
-                    args.push(n);
-                }
+                let args = build_k8s_namespace_args(namespace, all);
                 container::run(container::ContainerCmd::KubectlPods, &args, cli.verbose)?
             }
             KubectlCommands::Services { namespace, all } => {
-                let mut args: Vec<String> = Vec::new();
-                if all {
-                    args.push("-A".to_string());
-                } else if let Some(n) = namespace {
-                    args.push("-n".to_string());
-                    args.push(n);
-                }
+                let args = build_k8s_namespace_args(namespace, all);
                 container::run(container::ContainerCmd::KubectlServices, &args, cli.verbose)?
             }
             KubectlCommands::Logs { pod, container: c } => {
-                let mut args = vec![pod];
-                if let Some(cont) = c {
-                    args.push("-c".to_string());
-                    args.push(cont);
-                }
+                let args = build_k8s_logs_args(pod, c);
                 container::run(container::ContainerCmd::KubectlLogs, &args, cli.verbose)?
             }
             KubectlCommands::Other(args) => container::run_kubectl_passthrough(&args, cli.verbose)?,
+        },
+
+        Commands::Oc { command } => match command {
+            OcCommands::Get { args } => container::run_oc_get(&args, cli.verbose)?,
+            OcCommands::Pods { namespace, all } => {
+                let args = build_k8s_namespace_args(namespace, all);
+                container::k8s_pods("oc", &args, cli.verbose)?
+            }
+            OcCommands::Services { namespace, all } => {
+                let args = build_k8s_namespace_args(namespace, all);
+                container::k8s_services("oc", &args, cli.verbose)?
+            }
+            OcCommands::Logs { pod, container: c } => {
+                let args = build_k8s_logs_args(pod, c);
+                container::k8s_logs("oc", &args, cli.verbose)?
+            }
+            OcCommands::Other(args) => container::run_oc_passthrough(&args, cli.verbose)?,
         },
 
         Commands::Summary { command } => {
@@ -1758,24 +1861,22 @@ fn run_cli() -> Result<i32> {
         }
 
         Commands::Grep {
-            pattern,
-            path,
             max_len,
             max,
             context_only,
-            file_type,
-            line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
+            file_type: _,
             extra_args,
-        } => grep_cmd::run(
-            &pattern,
-            &path,
+        } => search::run(
+            search::Engine::Grep,
             max_len,
             max,
             context_only,
-            file_type.as_deref(),
             &extra_args,
             cli.verbose,
         )?,
+        Commands::Rg { extra_args } => {
+            search::run(search::Engine::Rg, 80, 200, false, &extra_args, cli.verbose)?
+        }
 
         Commands::Init {
             global,
@@ -1798,6 +1899,12 @@ fn run_cli() -> Result<i32> {
             };
             if show {
                 hooks::init::show_config(codex)?;
+            } else if uninstall && copilot {
+                if global {
+                    hooks::init::uninstall_copilot_global(ctx)?;
+                } else {
+                    hooks::init::uninstall_copilot(ctx)?;
+                }
             } else if uninstall {
                 uninstall_init_dispatch(
                     agent,
@@ -1818,7 +1925,13 @@ fn run_cli() -> Result<i32> {
                 };
                 hooks::init::run_gemini(global, hook_only, patch_mode, ctx)?;
             } else if copilot {
-                hooks::init::run_copilot(ctx)?;
+                if global {
+                    hooks::init::run_copilot_global(ctx)?;
+                } else {
+                    hooks::init::run_copilot(ctx)?;
+                }
+            } else if agent == Some(AgentTarget::Pi) {
+                hooks::init::run_pi_mode(global, ctx)?
             } else if agent == Some(AgentTarget::Kilocode) {
                 if global {
                     anyhow::bail!("Kilo Code is project-scoped. Use: rtk init --agent kilocode");
@@ -2144,6 +2257,8 @@ fn run_cli() -> Result<i32> {
 
         Commands::Gradlew { args } => gradlew_cmd::run(&args, cli.verbose)?,
 
+        Commands::Mvn { args } => mvn_cmd::run(&args, cli.verbose)?,
+
         Commands::HookAudit { since } => {
             hooks::hook_audit_cmd::run(since, cli.verbose)?;
             0
@@ -2461,8 +2576,10 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Dotnet { .. }
             | Commands::Docker { .. }
             | Commands::Kubectl { .. }
+            | Commands::Oc { .. }
             | Commands::Summary { .. }
             | Commands::Grep { .. }
+            | Commands::Rg { .. }
             | Commands::Wget { .. }
             | Commands::Vitest { .. }
             | Commands::Prisma { .. }
@@ -2638,6 +2755,42 @@ mod tests {
     }
 
     #[test]
+    fn test_try_parse_kubectl_get_alias() {
+        let cli = Cli::try_parse_from(["rtk", "kubectl", "get", "pods", "-n", "default"]).unwrap();
+
+        match cli.command {
+            Commands::Kubectl {
+                command: KubectlCommands::Get { args },
+            } => assert_eq!(args, vec!["pods", "-n", "default"]),
+            _ => panic!("Expected Kubectl Get command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_oc_get() {
+        let cli = Cli::try_parse_from(["rtk", "oc", "get", "pods", "-n", "default"]).unwrap();
+
+        match cli.command {
+            Commands::Oc {
+                command: OcCommands::Get { args },
+            } => assert_eq!(args, vec!["pods", "-n", "default"]),
+            _ => panic!("Expected Oc Get command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_oc_other() {
+        let cli = Cli::try_parse_from(["rtk", "oc", "new-project", "test"]).unwrap();
+
+        match cli.command {
+            Commands::Oc {
+                command: OcCommands::Other(_),
+            } => {}
+            _ => panic!("Expected Oc Other command"),
+        }
+    }
+
+    #[test]
     fn test_try_parse_init_agent_hermes_uninstall() {
         let cli = Cli::try_parse_from(["rtk", "init", "--agent", "hermes", "--uninstall"]).unwrap();
         match cli.command {
@@ -2672,7 +2825,7 @@ mod tests {
                 assert!(ctx.dry_run);
                 Ok(())
             },
-            |_, _, _, _, _| {
+            |_, _, _, _, _, _| {
                 standard_called.set(true);
                 Ok(())
             },
@@ -2766,6 +2919,81 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    /// Every subcommand must be in `RTK_META_COMMANDS` (fail closed) or
+    /// `PASSTHROUGH` (falls through to the real binary). Fails for any new
+    /// command until it's classified.
+    #[test]
+    fn test_every_subcommand_is_classified() {
+        use clap::CommandFactory;
+
+        const PASSTHROUGH: &[&str] = &[
+            "ls",
+            "tree",
+            "read",
+            "rg",
+            "git",
+            "gh",
+            "glab",
+            "aws",
+            "psql",
+            "pnpm",
+            "err",
+            "test",
+            "env",
+            "find",
+            "diff",
+            "log",
+            "dotnet",
+            "docker",
+            "kubectl",
+            "oc",
+            "summary",
+            "grep",
+            "wget",
+            "wc",
+            "jest",
+            "vitest",
+            "prisma",
+            "tsc",
+            "next",
+            "lint",
+            "prettier",
+            "format",
+            "playwright",
+            "cargo",
+            "npm",
+            "npx",
+            "curl",
+            "ruff",
+            "pytest",
+            "mypy",
+            "rake",
+            "rubocop",
+            "rspec",
+            "pip",
+            "go",
+            "gt",
+            "golangci-lint",
+            "gradlew",
+            "mvn",
+        ];
+
+        let unclassified: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .filter(|name| {
+                !RTK_META_COMMANDS.contains(&name.as_str()) && !PASSTHROUGH.contains(&name.as_str())
+            })
+            .collect();
+
+        assert!(
+            unclassified.is_empty(),
+            "unclassified subcommand(s) {:?}: add to RTK_META_COMMANDS (no system \
+             binary) or PASSTHROUGH (wraps a real tool)",
+            unclassified
+        );
     }
 
     #[test]
@@ -3117,6 +3345,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Integration test: requires `cargo build` first
+    fn test_broken_pipe_does_not_crash() {
+        let bin_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join("rtk");
+        assert!(
+            bin_path.exists(),
+            "Debug binary not found at {:?} - run `cargo build` first",
+            bin_path
+        );
+
+        let mut child = std::process::Command::new(&bin_path)
+            .args(["git", "log", "--oneline", "-50"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn rtk");
+
+        // Read one byte then drop stdout to close the pipe.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buf = [0u8; 1];
+        let _ = std::io::Read::read(&mut stdout, &mut buf);
+
+        let status = child.wait().expect("Failed to wait for rtk");
+        let code = status.code().unwrap_or(-1);
+
+        assert_ne!(
+            code, 134,
+            "rtk crashed with SIGABRT (exit 134) on broken pipe - SIGPIPE handler missing"
+        );
+    }
+
+    #[test]
     fn test_ultra_compact_long_form_still_works() {
         let cli = Cli::try_parse_from(["rtk", "--ultra-compact", "git", "status"]).unwrap();
         assert!(
@@ -3137,6 +3399,47 @@ mod tests {
                 assert_eq!(args, vec!["cowsay", "hello"]);
             }
             _ => panic!("Expected Commands::Npx for unknown tool"),
+        }
+    }
+
+    #[test]
+    fn test_init_pi_flag_rejected() {
+        // --pi has been removed; --agent pi is the canonical form
+        let result = Cli::try_parse_from(["rtk", "init", "--pi"]);
+        assert!(result.is_err(), "--pi must be rejected as unknown argument");
+    }
+
+    #[test]
+    fn test_init_agent_pi_parses() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--agent", "pi"]).unwrap();
+        match cli.command {
+            Commands::Init { agent, .. } => {
+                assert_eq!(
+                    agent,
+                    Some(AgentTarget::Pi),
+                    "--agent pi must set Pi variant"
+                );
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_uninstall_agent_pi_parses() {
+        let cli = Cli::try_parse_from(["rtk", "init", "--uninstall", "--agent", "pi", "--global"])
+            .unwrap();
+        match cli.command {
+            Commands::Init {
+                uninstall,
+                agent,
+                global,
+                ..
+            } => {
+                assert!(uninstall);
+                assert_eq!(agent, Some(AgentTarget::Pi));
+                assert!(global);
+            }
+            _ => panic!("Expected Init command"),
         }
     }
 }
