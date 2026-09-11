@@ -23,10 +23,10 @@
 ///   7. max_lines            — absolute line cap
 ///   8. on_empty             — message if result is empty
 use super::constants::RTK_META_COMMANDS;
-use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 // Built-in filters: concatenated from src/filters/*.toml by build.rs at compile time.
 const BUILTIN_TOML: &str = include_str!(concat!(env!("OUT_DIR"), "/builtin_filters.toml"));
@@ -235,6 +235,15 @@ impl TomlFilterRegistry {
 
         let mut compiled = Vec::new();
         for (name, def) in file.filters {
+            if !is_fully_anchored(&def.match_command) {
+                eprintln!(
+                    "[rtk] warning: filter '{}' in {}: match_command '{}' has a top-level branch \
+                     that does not start with '^'; it would match a path component mid-command. \
+                     Filter ignored.",
+                    name, source, def.match_command
+                );
+                continue;
+            }
             match compile_filter(name.clone(), def) {
                 Ok(f) => compiled.push(f),
                 Err(e) => eprintln!("[rtk] warning: filter '{}' in {}: {}", name, source, e),
@@ -274,6 +283,7 @@ const RUST_HANDLED_COMMANDS: &[&str] = &[
     "wc",
     "gain",
     "config",
+    "ctest",
     "vitest",
     "prisma",
     "tsc",
@@ -291,6 +301,7 @@ const RUST_HANDLED_COMMANDS: &[&str] = &[
     "pytest",
     "mypy",
     "pip",
+    "sqlfluff",
     "go",
     "golangci-lint",
     "rewrite",
@@ -395,9 +406,7 @@ fn compile_filter(name: String, def: TomlFilterDef) -> Result<CompiledFilter, St
 // Singleton (lazy-loaded, one-time cost)
 // ---------------------------------------------------------------------------
 
-lazy_static! {
-    static ref REGISTRY: TomlFilterRegistry = TomlFilterRegistry::load();
-}
+static REGISTRY: LazyLock<TomlFilterRegistry> = LazyLock::new(TomlFilterRegistry::load);
 
 pub fn toml_disabled() -> bool {
     std::env::var("RTK_NO_TOML").ok().as_deref() == Some("1")
@@ -420,9 +429,7 @@ pub fn filter_parse_error(content: &str) -> Option<String> {
         .map(|e| e.to_string())
 }
 
-lazy_static! {
-    static ref MATCH_SET: RegexSet = build_match_set();
-}
+static MATCH_SET: LazyLock<RegexSet> = LazyLock::new(build_match_set);
 
 pub fn command_matches_filter(command: &str) -> bool {
     MATCH_SET.is_match(command)
@@ -461,12 +468,70 @@ fn collect_match_patterns() -> Vec<String> {
     patterns
 }
 
+/// Strip a leading inline-flag group such as `(?i)` so the anchor check sees the
+/// pattern body. `(?:` opens a non-capturing group and is left alone.
+fn strip_inline_flags(branch: &str) -> &str {
+    let Some(rest) = branch.strip_prefix("(?") else {
+        return branch;
+    };
+    let Some(end) = rest.find(')') else {
+        return branch;
+    };
+    if rest[..end].chars().all(|c| "imsuxU-".contains(c)) {
+        &rest[end + 1..]
+    } else {
+        branch
+    }
+}
+
+/// Split `pattern` on top-level `|`, ignoring alternations nested inside groups
+/// or character classes.
+fn top_level_branches(pattern: &str) -> Vec<&str> {
+    let mut branches = Vec::new();
+    let mut depth = 0usize;
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut start = 0usize;
+
+    for (idx, character) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth = depth.saturating_sub(1),
+            '|' if !in_class && depth == 0 => {
+                branches.push(&pattern[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    branches.push(&pattern[start..]);
+    branches
+}
+
+/// A filter selects on argv[0], but its regex runs against the whole command
+/// line. A top-level branch that does not start with `^` therefore matches a
+/// path component or wrapper argument mid-line, so `timeout 5 /usr/bin/liquibase
+/// update` activates the liquibase filter and rewrites the wrapper instead.
+fn is_fully_anchored(pattern: &str) -> bool {
+    top_level_branches(pattern)
+        .iter()
+        .all(|branch| strip_inline_flags(branch).starts_with('^'))
+}
+
 fn match_patterns_in(content: &str) -> Vec<String> {
     match toml::from_str::<TomlFilterFile>(content) {
         Ok(file) if file.schema_version == 1 => file
             .filters
             .into_values()
             .map(|def| def.match_command)
+            .filter(|pattern| is_fully_anchored(pattern))
             .collect(),
         _ => Vec::new(),
     }
@@ -810,7 +875,7 @@ mod tests {
     use super::*;
 
     // Helper: build a CompiledFilter from inline TOML for tests.
-    // Never touches the lazy_static registry.
+    // Never touches the lazy registry.
     fn make_filters(toml: &str) -> Vec<CompiledFilter> {
         TomlFilterRegistry::parse_and_compile(toml, "test").expect("test TOML should be valid")
     }
@@ -860,6 +925,17 @@ mod tests {
         );
         assert!(filter_parse_error("[filters.a]\nmatch_command = \"^a\"\n").is_some());
         assert!(filter_parse_error("this is { not toml").is_some());
+    }
+
+    #[test]
+    fn test_toml_parse_tolerates_utf8_bom() {
+        // Hand-edited filter files on Windows often carry a BOM. The toml
+        // crate tolerates it natively — this pin is why the TOML file-read
+        // sites (config.rs, toml_filter.rs) deliberately skip
+        // strip_leading_bom; if a crate upgrade regresses this, add it there.
+        let bom = "\u{feff}schema_version = 1\n[filters.a]\nmatch_command = \"^a\"\n";
+        assert!(filter_parse_error(bom).is_none());
+        assert_eq!(match_patterns_in(bom), vec!["^a".to_string()]);
     }
 
     #[test]
@@ -1409,6 +1485,137 @@ make[1]: Leaving directory '/home/user/project/docs'
         );
     }
 
+    #[test]
+    fn test_spring_boot_match_command_requires_spring_named_jar() {
+        let filters = make_filters(BUILTIN_TOML);
+        let spring_boot = filters
+            .iter()
+            .find(|f| f.name == "spring-boot")
+            .expect("spring-boot filter must exist");
+
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match("java -jar build/libs/my-other-tool.jar"),
+            "a non-Spring jar must not activate the spring-boot filter"
+        );
+
+        let spring_jar = find_filter_in("java -jar build/libs/my-spring-app.jar", &filters)
+            .expect("a jar with 'spring' in its filename must still match");
+        assert_eq!(spring_jar.name, "spring-boot");
+
+        let mvn_run = find_filter_in("mvn spring-boot:run", &filters)
+            .expect("mvn spring-boot:run must still match");
+        assert_eq!(mvn_run.name, "spring-boot");
+
+        let capitalized = find_filter_in("java -jar build/libs/MySpringApp.jar", &filters)
+            .expect("a jar with 'Spring' capitalized in its filename must still match");
+        assert_eq!(capitalized.name, "spring-boot");
+
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match("java -jar /opt/spring-cache/other-tool.jar"),
+            "'spring' appearing only in a directory segment (not the jar filename itself) must not activate the spring-boot filter"
+        );
+
+        // Windows paths: '\' must be treated as a path separator too, not swallowed
+        // into the filename-only match (the exact bug this guard exists to catch).
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\spring-cache\other.jar"),
+            "'spring' appearing only in a Windows directory segment must not activate the spring-boot filter"
+        );
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\dev\spring-workspace\build\other-tool.jar"),
+            "'spring' appearing only in a nested Windows directory segment must not activate the spring-boot filter"
+        );
+        assert!(
+            spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\dev\my-spring-app.jar"),
+            "a Windows-path jar with 'spring' in its own filename must still match"
+        );
+
+        // argv reaches this regex as one space-joined string, so a path containing spaces
+        // is indistinguishable from a following argument. Widening the prefix across
+        // whitespace would let a later 'spring'-named jar argument re-trigger the filter,
+        // so jars under such a path stay on full passthrough instead.
+        assert!(
+            !spring_boot
+                .match_regex
+                .is_match(r"java -jar C:\Program Files\app\my-spring-app.jar"),
+            "a jar under a path containing spaces is deliberately left to full passthrough"
+        );
+    }
+
+    #[test]
+    fn test_liquibase_match_command_ignores_path_substring() {
+        let filters = make_filters(BUILTIN_TOML);
+        let liquibase = filters
+            .iter()
+            .find(|f| f.name == "liquibase")
+            .expect("liquibase filter must exist");
+
+        assert!(
+            !liquibase.match_regex.is_match("rm -rf /opt/liquibase"),
+            "'liquibase' appearing only as a path argument must not activate the liquibase filter"
+        );
+
+        let bare = find_filter_in("liquibase status", &filters)
+            .expect("bare liquibase invocation must still match");
+        assert_eq!(bare.name, "liquibase");
+
+        // Production callers (run_fallback in src/main.rs, strip_absolute_path in
+        // src/discover/registry.rs) always basename argv[0] before this regex runs,
+        // so a raw path-qualified string must NOT match on its own — the regex has
+        // no path-prefix branch to fall back on.
+        assert!(
+            !liquibase
+                .match_regex
+                .is_match("/usr/local/bin/liquibase update"),
+            "a raw path-qualified invocation must not match — callers basename argv[0] before matching"
+        );
+
+        for wrapped in [
+            "timeout 5 /usr/bin/liquibase update",
+            "nohup /opt/tools/liquibase update",
+        ] {
+            assert!(
+                !liquibase.match_regex.is_match(wrapped),
+                "a wrapper command must not activate the liquibase filter: {wrapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ssh_match_command_excludes_ssh_dash_utilities() {
+        let filters = make_filters(BUILTIN_TOML);
+        let ssh = filters
+            .iter()
+            .find(|f| f.name == "ssh")
+            .expect("ssh filter must exist");
+
+        assert!(
+            !ssh.match_regex.is_match("ssh-keygen -t ed25519"),
+            "ssh-keygen must not activate the plain ssh connection filter"
+        );
+        assert!(
+            !ssh.match_regex.is_match("ssh-add id_ed25519"),
+            "ssh-add must not activate the plain ssh connection filter"
+        );
+
+        let plain = find_filter_in("ssh user@host", &filters)
+            .expect("plain ssh invocation must still match");
+        assert_eq!(plain.name, "ssh");
+
+        let bare = find_filter_in("ssh", &filters).expect("bare ssh with no args must still match");
+        assert_eq!(bare.name, "ssh");
+    }
+
     // --- Edge cases ---
 
     #[test]
@@ -1900,6 +2107,55 @@ match_command = "^make\\b"
             "Expected exactly 63 built-in filters, got {}. \
              Update this count when adding/removing filters in src/filters/.",
             filters.len()
+        );
+    }
+
+    /// Every built-in filter must be anchored on every top-level branch: the
+    /// match runs against the whole command line, so an unanchored branch
+    /// activates the filter on a path component or wrapper argument.
+    #[test]
+    fn test_builtin_all_filters_match_command_anchored() {
+        // Read the raw patterns rather than the compiled registry: both loaders
+        // drop unanchored filters, so a compiled view cannot observe one.
+        let file: TomlFilterFile =
+            toml::from_str(BUILTIN_TOML).expect("built-in filters should parse");
+        assert!(!file.filters.is_empty());
+        for (name, def) in &file.filters {
+            assert!(
+                is_fully_anchored(&def.match_command),
+                "Filter '{}' has match_command '{}' with a top-level branch that does not start with '^'",
+                name,
+                def.match_command
+            );
+        }
+
+        assert!(is_fully_anchored(r"^liquibase(?:\s|$)"));
+        assert!(is_fully_anchored(r"^(liquibase\b|/liquibase\b)"));
+        assert!(is_fully_anchored(r"^pnpm\b|^npm\b"));
+        assert!(is_fully_anchored(r"(?i)^liquibase\b"));
+        assert!(!is_fully_anchored(r"^liquibase\b|/liquibase\b"));
+        assert!(!is_fully_anchored(r"(?:^|/)liquibase(?:\s|$)"));
+    }
+
+    /// The invariant above covers `BUILTIN_TOML`; project-local and global
+    /// filters are user-authored, so both loaders drop unanchored patterns
+    /// rather than letting them match mid-command.
+    #[test]
+    fn test_unanchored_user_filter_is_rejected_by_both_loaders() {
+        let unanchored =
+            "schema_version = 1\n[filters.mytool]\nmatch_command = \"(?:^|/)mytool\\\\b\"\n";
+        assert!(match_patterns_in(unanchored).is_empty());
+        assert!(TomlFilterRegistry::parse_and_compile(unanchored, "test")
+            .expect("schema is valid")
+            .is_empty());
+
+        let anchored = "schema_version = 1\n[filters.mytool]\nmatch_command = \"^mytool\\\\b\"\n";
+        assert_eq!(match_patterns_in(anchored), vec!["^mytool\\b".to_string()]);
+        assert_eq!(
+            TomlFilterRegistry::parse_and_compile(anchored, "test")
+                .expect("schema is valid")
+                .len(),
+            1
         );
     }
 
