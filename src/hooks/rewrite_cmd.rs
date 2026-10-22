@@ -1,34 +1,24 @@
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
-use super::permissions::{check_command, PermissionVerdict};
-use crate::discover::registry;
+use super::decision::{self, HookDecision};
+use super::permissions::check_command;
+use crate::core::user_dirs;
 use std::io::Write;
 
-/// Run the `rtk rewrite` command.
-///
-/// Prints the RTK-rewritten command to stdout and exits with a code that tells
-/// the caller how to handle permissions:
-///
-/// | Exit | Stdout   | Meaning                                                      |
-/// |------|----------|--------------------------------------------------------------|
-/// | 0    | rewritten| Rewrite allowed — hook may auto-allow the rewritten command. |
-/// | 1    | (none)   | No RTK equivalent — hook passes through unchanged.           |
-/// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.  |
-/// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt.|
 const TEE_READERS: &[&str] = &[
     "cat", "tail", "head", "less", "more", "bat", "grep", "rg", "sed", "awk",
 ];
 
 fn expand_home(token: &str) -> String {
-    if let Some(rest) = token.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
+    if let Some(rest) = token.strip_prefix("~/")
+        && let Some(home) = user_dirs::home()
+    {
+        return home.join(rest).to_string_lossy().into_owned();
     }
-    if let Some(rest) = token.strip_prefix("$HOME/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
+    if let Some(rest) = token.strip_prefix("$HOME/")
+        && let Some(home) = user_dirs::home()
+    {
+        return home.join(rest).to_string_lossy().into_owned();
     }
     token.to_string()
 }
@@ -50,10 +40,12 @@ fn tee_read_slug(cmd: &str, tee_dir: &std::path::Path) -> Option<(String, String
             continue;
         }
         let stem = path.file_stem()?.to_str()?;
-        if let Some((epoch, slug)) = stem.split_once('_') {
-            if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) && !slug.is_empty() {
-                return Some((slug.to_string(), expanded));
-            }
+        if let Some((epoch, slug)) = stem.split_once('_')
+            && !epoch.is_empty()
+            && epoch.chars().all(|c| c.is_ascii_digit())
+            && !slug.is_empty()
+        {
+            return Some((slug.to_string(), expanded));
         }
     }
     None
@@ -71,74 +63,62 @@ pub(crate) fn track_tee_read(cmd: &str) {
     }
 }
 
+/// Run the `rtk rewrite` command.
+///
+/// Prints the RTK-rewritten command to stdout and exits with a code that tells
+/// the caller how to handle permissions:
+///
+/// | Exit | Stdout   | Meaning                                                                  |
+/// |------|----------|--------------------------------------------------------------------------|
+/// | 0    | rewritten| Allow rules cover every command — hook may auto-allow the rewrite.       |
+/// | 1    | (none)   | No rewrite, or a deny rule matched inside a shell wrapper's script ([`decision::decide`] deferred) — hook passes through. |
+/// | 2    | (none)   | Deny rule matched — hook defers to the host's native deny.               |
+/// | 3    | rewritten| Ask rule, or allow rules short of every command (also with no rules) — hook rewrites, host prompts. |
+///
+/// The decision itself is [`decision::decide`], shared with the in-process
+/// `rtk hook <agent>` path; this function is only its exit-code rendering.
+///
+/// A delegate that gates the rewritten command itself can set
+/// [`decision::REWRITE_HOST_ENV`] to its agent name (`openclaw` is the only one
+/// that resolves to [`decision::ApprovalOwner::Delegate`]), which renders a
+/// *default* ask (no ask rule, allow rules short of every command) as exit 0
+/// for it and nothing else. An explicit `ask` rule the user wrote still renders
+/// as exit 3, so the host can keep prompting for the command the user asked
+/// about, and [`decision::ApprovalOwner::apply`] cannot transform a
+/// [`HookDecision::Deny`]: an explicit deny still reaches this function as
+/// `Deny` and still renders as exit 2, for every delegate, named or not.
 pub fn run(cmd: &str) -> anyhow::Result<()> {
-    let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
-
-    let outcome = evaluate(cmd, &excluded, &transparent_prefixes);
-    if !matches!(outcome, RewriteOutcome::Deny) {
+    // `rtk rewrite` has one rule source for every delegate that shells out to
+    // it -- hermes, omp, opencode, openclaw, pi -- and that is `~/.claude`'s
+    // rules. The in-process `rtk hook <agent>` path is host-parameterized
+    // instead (`permissions::Host`). What a delegate may say about itself is
+    // only who owns approval, never whose rules apply.
+    let verdict = check_command(cmd);
+    let decided =
+        decision::ApprovalOwner::from_env().apply(decision::decide(cmd, verdict), verdict);
+    if !matches!(decided, HookDecision::Deny) {
         track_tee_read(cmd);
     }
-    match outcome {
-        RewriteOutcome::Allow(rewritten) => {
+    match decided {
+        HookDecision::AllowRewrite(rewritten) => {
             print!("{}", rewritten);
             let _ = std::io::stdout().flush();
             Ok(())
         }
-        RewriteOutcome::Ask(rewritten) => {
+        HookDecision::AskRewrite(rewritten) => {
             print!("{}", rewritten);
             let _ = std::io::stdout().flush();
             std::process::exit(3);
         }
-        RewriteOutcome::Deny => std::process::exit(2),
-        RewriteOutcome::Passthrough => std::process::exit(1),
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum RewriteOutcome {
-    Allow(String),
-    Passthrough,
-    Deny,
-    Ask(String),
-}
-
-fn evaluate(cmd: &str, excluded: &[String], transparent_prefixes: &[String]) -> RewriteOutcome {
-    evaluate_with_verdict(cmd, check_command(cmd), excluded, transparent_prefixes)
-}
-
-/// Decision logic for [`evaluate`] with the permission verdict supplied by the
-/// caller, mirroring [`check_command_with_rules`](super::permissions::check_command_with_rules).
-///
-/// `check_command` reads the machine's Claude Code settings files, so tests that
-/// call [`evaluate`] directly would change verdict with the developer's local
-/// `settings.local.json`. Taking the verdict as a parameter keeps the rewrite
-/// logic under test independent of the host configuration (#3146).
-fn evaluate_with_verdict(
-    cmd: &str,
-    verdict: PermissionVerdict,
-    excluded: &[String],
-    transparent_prefixes: &[String],
-) -> RewriteOutcome {
-    if verdict == PermissionVerdict::Deny {
-        return RewriteOutcome::Deny;
-    }
-
-    if crate::discover::lexer::contains_unattestable_construct(cmd) {
-        return RewriteOutcome::Passthrough;
-    }
-
-    match registry::rewrite_command(cmd, excluded, transparent_prefixes) {
-        Some(rewritten) => match verdict {
-            PermissionVerdict::Allow => RewriteOutcome::Allow(rewritten),
-            _ => RewriteOutcome::Ask(rewritten),
-        },
-        None => RewriteOutcome::Passthrough,
+        HookDecision::Deny => std::process::exit(2),
+        HookDecision::Defer => std::process::exit(1),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discover::registry;
 
     #[test]
     fn test_tee_read_slug_detects_tail_hint_command() {
@@ -223,106 +203,6 @@ mod tests {
         );
     }
 
-    /// The verdict still drives the outcome: an allow rule yields `Allow`.
-    /// Pinning both directions keeps the mapping covered without depending
-    /// on which rules the developer happens to have configured.
-    #[test]
-    fn test_allow_verdict_yields_allow() {
-        assert!(matches!(
-            evaluate_with_verdict("git status", PermissionVerdict::Allow, &[], &[]),
-            RewriteOutcome::Allow(_)
-        ));
-    }
-
-    #[test]
-    fn test_deny_verdict_yields_deny() {
-        assert_eq!(
-            evaluate_with_verdict("git status", PermissionVerdict::Deny, &[], &[]),
-            RewriteOutcome::Deny
-        );
-    }
-
-    /// Commands with an unattestable construct are always a passthrough,
-    /// regardless of permission verdict.
-    ///
-    /// The verdict is pinned to `Default` rather than going through `evaluate`,
-    /// which reads the developer's own `.claude/settings.local.json`: a
-    /// `Bash(git *)` allow rule turns the expected `Ask` into `Allow` and these
-    /// tests fail on that machine only (#3146). Pinning the verdict keeps the
-    /// assertions about the rewrite logic and nothing about the host.
-    mod unattestable_passthrough {
-        use super::super::{evaluate_with_verdict, RewriteOutcome};
-        use crate::hooks::permissions::PermissionVerdict;
-
-        #[test]
-        fn test_backtick_substitution_passthrough() {
-            assert_eq!(
-                evaluate_with_verdict(
-                    "git status `rm -rf /tmp/x`",
-                    PermissionVerdict::Default,
-                    &[],
-                    &[]
-                ),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_dollar_substitution_passthrough() {
-            assert_eq!(
-                evaluate_with_verdict(
-                    "git status $(rm -rf /tmp/x)",
-                    PermissionVerdict::Default,
-                    &[],
-                    &[]
-                ),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_double_quoted_substitution_passthrough() {
-            assert_eq!(
-                evaluate_with_verdict(
-                    "git log --pretty=\"$(rm -rf /tmp/x)\"",
-                    PermissionVerdict::Default,
-                    &[],
-                    &[]
-                ),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_file_redirect_passthrough() {
-            assert_eq!(
-                evaluate_with_verdict(
-                    "git log > /tmp/out.txt",
-                    PermissionVerdict::Default,
-                    &[],
-                    &[]
-                ),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_fd_dup_redirect_still_rewrites() {
-            assert!(matches!(
-                evaluate_with_verdict("git status 2>&1", PermissionVerdict::Default, &[], &[]),
-                RewriteOutcome::Ask(_)
-            ));
-        }
-
-        #[test]
-        fn test_plain_command_still_rewrites() {
-            assert!(matches!(
-                evaluate_with_verdict("git status", PermissionVerdict::Default, &[], &[]),
-                RewriteOutcome::Ask(_)
-            ));
-        }
-    }
-
     /// SECURITY: Verify the exit code protocol for permission verdicts.
     ///
     /// The bash hook (.claude/hooks/rtk-rewrite.sh) interprets exit codes as:
@@ -337,19 +217,21 @@ mod tests {
     /// See: https://github.com/rtk-ai/rtk/issues/1155
     mod exit_code_protocol {
         use super::registry;
-        use crate::hooks::permissions::{check_command_with_rules, PermissionVerdict};
+        use crate::hooks::permissions::{PermissionVerdict, check_command_with_rules};
 
         /// Exit code that `run()` returns for each verdict:
         ///   Allow  → 0 (exit Ok(()))
         ///   Ask    → 3 (process::exit(3))
         ///   Default→ 3 (process::exit(3)) — grouped with Ask
         ///   Deny   → 2 (process::exit(2)) — handled before rewrite match
+        ///   Defer  → 1 (process::exit(1)) — passthrough, no rewrite
         fn expected_exit_code(verdict: &PermissionVerdict) -> i32 {
             match verdict {
                 PermissionVerdict::Allow => 0,
                 PermissionVerdict::Deny => 2,
                 PermissionVerdict::Ask => 3,
                 PermissionVerdict::Default => 3, // MUST be 3, not 0!
+                PermissionVerdict::Defer => 1,
             }
         }
 
@@ -363,6 +245,15 @@ mod tests {
                 3,
                 "Default verdict MUST exit with code 3 (ask), not 0 (allow)"
             );
+        }
+
+        #[test]
+        fn test_defer_verdict_maps_to_passthrough_exit_code() {
+            let deny = vec!["git push:*".to_string()];
+            let allow = vec!["*".to_string()];
+            let verdict = check_command_with_rules("env bash -c 'git push'", &deny, &[], &allow);
+            assert_eq!(verdict, PermissionVerdict::Defer);
+            assert_eq!(expected_exit_code(&verdict), 1);
         }
 
         #[test]

@@ -3,13 +3,18 @@ use super::constants::{
     SETTINGS_JSON, SETTINGS_LOCAL_JSON,
 };
 use super::init::resolve_claude_dir;
-use crate::core::stream::exec_capture;
-use crate::discover::lexer::{is_word_boundary_whitespace, split_for_permissions};
+use crate::core::user_dirs;
+use crate::core::user_env;
+use crate::discover::lexer::{
+    is_word_boundary_whitespace, split_for_permissions, split_for_wrappers,
+};
+use crate::discover::registry;
+use crate::discover::shell_wrapper::{is_shell_wrapper_candidate, parse_shell_wrapper};
 use serde_json::Value;
 use std::path::PathBuf;
 
 /// Verdict from checking a command against Claude Code's permission rules.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PermissionVerdict {
     /// An explicit allow rule matched — safe to auto-allow.
     Allow,
@@ -19,11 +24,13 @@ pub enum PermissionVerdict {
     Ask,
     /// No rule matched — default to ask (matches Claude Code's least-privilege default).
     Default,
+    /// A deny rule matched inside a shell wrapper's script — RTK neither rewrites nor decides.
+    Defer,
 }
 
 /// Check `cmd` against Claude Code's deny/ask/allow permission rules.
 ///
-/// Precedence: Deny > Ask > Allow > Default (ask).
+/// Precedence: Deny > Defer > Ask > Allow > Default (ask).
 /// Returns `Default` when no rules match — callers should treat this as ask
 /// to match Claude Code's least-privilege default.
 pub fn check_command(cmd: &str) -> PermissionVerdict {
@@ -34,15 +41,34 @@ pub fn check_command(cmd: &str) -> PermissionVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
     Claude,
+    Codex,
+    Trae,
     Cursor,
     Gemini,
     Droid,
     Vibe,
+    Antigravity,
+    OpenCode,
 }
 
 pub fn check_command_for(cmd: &str, host: Host) -> PermissionVerdict {
+    check_command_for_agent(cmd, host, None)
+}
+
+pub fn check_command_for_agent(cmd: &str, host: Host, agent: Option<&str>) -> PermissionVerdict {
+    if host == Host::OpenCode {
+        let rules = super::permissions_opencode::load_opencode_rules(agent);
+        return super::permissions_opencode::check_command_with_opencode_rules(cmd, &rules);
+    }
     let (deny_rules, ask_rules, allow_rules) = load_rules_for(host);
-    check_command_with_rules(cmd, &deny_rules, &ask_rules, &allow_rules)
+    let (_, transparent_prefixes) = crate::core::config::hook_rewrite_params();
+    check_command_with_rules_and_prefixes(
+        cmd,
+        &deny_rules,
+        &ask_rules,
+        &allow_rules,
+        &transparent_prefixes,
+    )
 }
 
 /// Load `host`'s deny/ask/allow Bash rules from disk, doing the settings-file I/O
@@ -57,16 +83,36 @@ pub(crate) fn load_rules_for(host: Host) -> (Vec<String>, Vec<String>, Vec<Strin
         Host::Cursor => load_cursor_rules(),
         Host::Gemini => load_gemini_rules(),
         Host::Droid => load_droid_rules(),
-        Host::Vibe => (Vec::new(), Vec::new(), Vec::new()),
+        // Hosts with no RTK-side rule source. Codex enforces its native
+        // execution rules after updatedInput. Do not interpret these hosts'
+        // rules as Claude Bash patterns or borrow another host's settings.
+        // No RTK-side match means Default, not an explicit Allow.
+        Host::Codex | Host::Trae | Host::Vibe | Host::Antigravity => {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+        Host::OpenCode => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
 /// Internal implementation allowing tests to inject rules without file I/O.
+#[cfg(test)]
 pub(crate) fn check_command_with_rules(
     cmd: &str,
     deny_rules: &[String],
     ask_rules: &[String],
     allow_rules: &[String],
+) -> PermissionVerdict {
+    check_command_with_rules_and_prefixes(cmd, deny_rules, ask_rules, allow_rules, &[])
+}
+
+/// `check_command_with_rules` with the `transparent_prefixes` the rewrite
+/// strips, so a wrapper behind one of them is gated where the rewrite reaches it.
+pub(crate) fn check_command_with_rules_and_prefixes(
+    cmd: &str,
+    deny_rules: &[String],
+    ask_rules: &[String],
+    allow_rules: &[String],
+    transparent_prefixes: &[String],
 ) -> PermissionVerdict {
     let segments = split_compound_command(cmd);
 
@@ -74,10 +120,21 @@ pub(crate) fn check_command_with_rules(
     for segment in &segments {
         let segment = segment.trim();
         for pattern in deny_rules {
-            if command_matches_pattern(segment, pattern) {
+            if command_matches_pattern(segment, pattern)
+                || command_matches_pattern(strip_grammar_residue(segment), pattern)
+            {
                 return PermissionVerdict::Deny;
             }
         }
+    }
+
+    let transparent_prefixes = registry::normalize_transparent_prefixes(transparent_prefixes);
+    let joined = registry::collapse_line_continuations(cmd);
+    let wrapper_segments = split_for_wrappers(&joined);
+    if let Some(verdict) =
+        check_shell_wrapper_permissions(&wrapper_segments, deny_rules, &transparent_prefixes)
+    {
+        return verdict;
     }
 
     // Can't decompose substitution / file-target redirects — never auto-allow.
@@ -102,7 +159,9 @@ pub(crate) fn check_command_with_rules(
         // Ask — if any segment matches an ask rule, the final verdict is Ask.
         if !any_ask {
             for pattern in ask_rules {
-                if command_matches_pattern(segment, pattern) {
+                if command_matches_pattern(segment, pattern)
+                    || command_matches_pattern(strip_grammar_residue(segment), pattern)
+                {
                     any_ask = true;
                     break;
                 }
@@ -121,7 +180,7 @@ pub(crate) fn check_command_with_rules(
         }
     }
 
-    // Precedence: Deny > Ask > Allow > Default (ask).
+    // Precedence: Deny > Defer > Ask > Allow > Default (ask).
     // Allow requires (1) at least one segment seen, (2) all segments matched, (3) non-empty rules.
     if any_ask {
         PermissionVerdict::Ask
@@ -130,6 +189,57 @@ pub(crate) fn check_command_with_rules(
     } else {
         PermissionVerdict::Default
     }
+}
+
+fn check_shell_wrapper_permissions(
+    segments: &[&str],
+    deny_rules: &[String],
+    transparent_prefixes: &[String],
+) -> Option<PermissionVerdict> {
+    let mut contains_shell_wrapper = false;
+    for segment in segments {
+        for (depth, position) in registry::shell_wrapper_positions(segment, transparent_prefixes)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(wrapper) = parse_shell_wrapper(position) else {
+                if depth == 0 {
+                    contains_shell_wrapper |= is_shell_wrapper_candidate(position);
+                }
+                continue;
+            };
+            if depth == 0 {
+                contains_shell_wrapper = true;
+            }
+            let Some(script) = wrapper.script(position) else {
+                continue;
+            };
+            // Both spellings, exactly as the outer loop above: a segment can open
+            // with grammar that is not part of the command (`! rm …`, `{ rm …`),
+            // and a rule naming the command has to reach it there too.
+            let inner_denied = split_for_permissions(script).iter().any(|inner_segment| {
+                let inner_segment = inner_segment.trim();
+                let readings = registry::shell_wrapper_positions(
+                    strip_grammar_residue(inner_segment),
+                    transparent_prefixes,
+                );
+                std::iter::once(inner_segment)
+                    .chain(readings)
+                    .any(|reading| {
+                        deny_rules
+                            .iter()
+                            .any(|pattern| command_matches_pattern(reading, pattern))
+                    })
+            });
+            if inner_denied {
+                return Some(PermissionVerdict::Defer);
+            }
+        }
+    }
+
+    // A quoted shell script hides a second parsing boundary from the host rule.
+    // Rewriting it is useful, but RTK must never turn that into auto-approval.
+    contains_shell_wrapper.then_some(PermissionVerdict::Ask)
 }
 
 /// Load deny, ask, and allow Bash rules from all Claude Code settings files.
@@ -177,10 +287,10 @@ fn append_bash_rules(rules_value: Option<&Value>, target: &mut Vec<String>) {
         return;
     };
     for rule in arr {
-        if let Some(s) = rule.as_str() {
-            if s.starts_with("Bash(") {
-                target.push(extract_bash_pattern(s).to_string());
-            }
+        if let Some(s) = rule.as_str()
+            && s.starts_with("Bash(")
+        {
+            target.push(extract_bash_pattern(s).to_string());
         }
     }
 }
@@ -248,7 +358,7 @@ fn append_wrapped_rules(rules_value: Option<&Value>, prefixes: &[&str], target: 
 // else defers to the host, which applies its own project config and folder-trust.
 // This keeps RTK's allow set a subset of the host's — never more permissive.
 fn global_config(dir: &str, file: &str) -> Option<Value> {
-    read_json(&dirs::home_dir()?.join(dir).join(file))
+    read_json(&user_dirs::home()?.join(dir).join(file))
 }
 
 fn load_cursor_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -270,7 +380,7 @@ fn load_cursor_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
 // untrusted → global, which is safe: never more permissive than the host).
 fn gemini_settings() -> Option<Value> {
     let global = global_config(GEMINI_DIR, SETTINGS_JSON);
-    let trusted = std::env::var("GEMINI_CLI_TRUST_WORKSPACE").as_deref() == Ok("true")
+    let trusted = user_env::var("GEMINI_CLI_TRUST_WORKSPACE").as_deref() == Some("true")
         || !global
             .as_ref()
             .and_then(|j| {
@@ -278,12 +388,11 @@ fn gemini_settings() -> Option<Value> {
                     .and_then(Value::as_bool)
             })
             .unwrap_or(false);
-    if trusted {
-        if let Some(root) = find_project_root() {
-            if let Some(v) = read_json(&root.join(GEMINI_DIR).join(SETTINGS_JSON)) {
-                return Some(v);
-            }
-        }
+    if trusted
+        && let Some(root) = find_project_root()
+        && let Some(v) = read_json(&root.join(GEMINI_DIR).join(SETTINGS_JSON))
+    {
+        return Some(v);
     }
     global
 }
@@ -304,10 +413,10 @@ fn load_gemini_rules() -> (Vec<String>, Vec<String>, Vec<String>) {
 // (docs.factory.ai/cli/configuration/settings). Missing files are skipped.
 fn droid_settings_scopes() -> Vec<Value> {
     let mut dirs_to_read = Vec::new();
-    if let Some(home) = std::env::var_os(DROID_HOME_ENV)
+    if let Some(home) = user_dirs::env_path(DROID_HOME_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+        .or_else(user_dirs::home)
     {
         dirs_to_read.push(home.join(DROID_DIR));
     }
@@ -361,43 +470,48 @@ pub(crate) fn droid_rules_from_settings(
 ///
 /// Falls back to `git rev-parse --show-toplevel` if not found via directory walk.
 fn find_project_root() -> Option<PathBuf> {
-    // Fast path: walk up CWD looking for .claude/ — no subprocess needed.
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join(CLAUDE_DIR).exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-
-    // Fallback: git (spawns a subprocess, slower but handles monorepo layouts).
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["rev-parse", "--show-toplevel"]);
-    let result = exec_capture(&mut cmd).ok()?;
-
-    if result.success() {
-        return Some(PathBuf::from(result.stdout.trim()));
-    }
-
-    None
+    user_dirs::project_root(CLAUDE_DIR)
 }
 
 /// Extract the pattern string from inside `Bash(pattern)`.
 ///
 /// Returns the original string unchanged if it does not match the expected format.
 pub(crate) fn extract_bash_pattern(rule: &str) -> &str {
-    if let Some(inner) = rule.strip_prefix("Bash(") {
-        if let Some(pattern) = inner.strip_suffix(')') {
-            return pattern;
-        }
+    if let Some(inner) = rule.strip_prefix("Bash(")
+        && let Some(pattern) = inner.strip_suffix(')')
+    {
+        return pattern;
     }
     rule
 }
 
 /// Check if `cmd` matches a Claude Code permission pattern.
 ///
+/// `split_for_permissions` does not treat `{`/`}` as boundaries, so
+/// `... && { rm -rf / ; }` arrives as `{ rm -rf /` and no exact deny pattern
+/// matches it.
+///
+/// Deny and ask only, never allow: stripping can only make a rule fire on more
+/// segments, so a verdict can get stricter but never looser. On the allow side
+/// it would let `{ ls` inherit an `ls` rule and turn a prompt into an
+/// auto-approve.
+fn strip_grammar_residue(segment: &str) -> &str {
+    let mut rest = segment.trim();
+    loop {
+        // Only a standalone word is grammar. `!rm` is history expansion, not
+        // negation, and `{foo` is a brace expansion, not a group.
+        let stripped = match rest.split_once([' ', '\t']) {
+            Some(("{" | "}" | "!" | "(" | ")", tail)) => tail,
+            _ => return rest,
+        };
+        let next = stripped.trim_start();
+        if next == rest {
+            return rest;
+        }
+        rest = next;
+    }
+}
+
 /// Pattern forms:
 /// - `*` → matches everything
 /// - `prefix:*` or `prefix *` (trailing `*`, no other wildcards) → prefix match with word boundary
@@ -406,8 +520,17 @@ pub(crate) fn extract_bash_pattern(rule: &str) -> &str {
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
     // Shares the lexer's word-boundary definition rather than
     // str::split_whitespace(), so a bare `\r` in `cmd` never collapses into a space.
+    //
+    // A line continuation is removed first: bash elides `\<newline>` entirely
+    // and joins the words either side, so splitting on the newline alone would
+    // leave a stray `\` in front of the command that no pattern matches.
+    //
+    // Only the LF form: against CRLF the backslash escapes the `\r` and the
+    // `\n` still terminates the command, in bash and in the lexer alike, so
+    // the words either side are already separate segments.
     let normalize = |s: &str| {
-        s.split(is_word_boundary_whitespace)
+        s.replace("\\\n", "")
+            .split(is_word_boundary_whitespace)
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
@@ -1269,6 +1392,580 @@ mod tests {
         assert_eq!(
             check_command_with_rules("rm -rf /", &[], &[], &allow),
             PermissionVerdict::Default
+        );
+    }
+
+    #[test]
+    fn test_ansi_c_quote_divergence_is_never_auto_allowed() {
+        let allow = vec!["git:*".to_string()];
+        let cmd = r#"git status $'\'' ; rm -rf /"#;
+
+        assert_eq!(
+            check_command_with_rules(cmd, &[], &[], &allow),
+            PermissionVerdict::Ask,
+            "a command whose quoting the lexer cannot follow must prompt, \
+             never auto-allow: {cmd}"
+        );
+
+        // The plain form still allows, so the guard is about the divergence
+        // and not about `git` or about quoting in general.
+        assert_eq!(
+            check_command_with_rules("git status", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            check_command_with_rules("git commit -m 'a b'", &[], &[], &allow),
+            PermissionVerdict::Allow
+        );
+
+        // An escaped `$` opens no ANSI-C span, so there is no divergence and
+        // nothing to prompt about.
+        assert_eq!(
+            check_command_with_rules(r"git status \$'x'", &[], &[], &allow),
+            PermissionVerdict::Allow,
+            "an escaped dollar is a literal, not the start of ANSI-C quoting"
+        );
+    }
+
+    #[test]
+    fn test_shell_wrapper_never_auto_allowed() {
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules(r#"bash -c "head foo && grep -R bar .""#, &[], &[], &allow),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn test_leading_redirect_still_reaches_the_deny_rules() {
+        let deny = vec!["git push --force".to_string()];
+
+        for cmd in [
+            "2>&1 git push --force",
+            "1>&2 git push --force",
+            ">out git push --force",
+            "2>/dev/null git push --force",
+            // Grammar in front of the redirect.
+            "{ 2>&1 git push --force ; }",
+            "! 2>&1 git push --force",
+            "ls && { 2>&1 git push --force ; }",
+            // Operands the tokenizer splits across several adjacent tokens.
+            ">$HOME/x git push --force",
+            "<&0 git push --force",
+            // A boundary ends the operand even with no gap, or the command
+            // right behind it is swallowed along with the filename.
+            ">a|git push --force",
+            ">a;git push --force",
+            ">a&&git push --force",
+            ">out& git push --force",
+            "2>&1& git push --force",
+            // No space after the `&`, which would create a token gap.
+            "2>&1&git push --force",
+            ">&2&git push --force",
+            // Two redirects glued together.
+            "2>&1<&0 git push --force",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &[]),
+                PermissionVerdict::Deny,
+                "a leading redirect must not hide the command from deny rules: {cmd}"
+            );
+        }
+
+        // A trailing redirect keeps its existing treatment.
+        assert_eq!(
+            check_command_with_rules("git push --force 2>&1", &deny, &[], &[]),
+            PermissionVerdict::Deny
+        );
+    }
+
+    #[test]
+    fn test_shell_wrapper_inner_deny_defers() {
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules(
+                "bash -c 'git status; rm -rf /tmp/example'",
+                &deny,
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Defer
+        );
+    }
+
+    /// A segment of the inner script can open with grammar that is not part of
+    /// the command. The outer gate strips it before matching; so must the
+    /// wrapper's own check, or `bash -c 'git status; ! rm …'` is rewritten
+    /// while `bash -c 'git status && (rm …)'` and the same commands unwrapped
+    /// are denied.
+    #[test]
+    fn test_shell_wrapper_inner_deny_sees_through_grammar() {
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "bash -c 'git status; ! rm -rf /tmp/example'",
+            "bash -c 'git status && { rm -rf /tmp/example; }'",
+            "sh -c 'git status; ! rm -rf /tmp/example'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Defer,
+                "{cmd:?}"
+            );
+        }
+        // The grammar itself names no command, so a script without a denied
+        // one is unaffected.
+        assert_eq!(
+            check_command_with_rules("bash -c 'git status; ! cargo test'", &deny, &[], &allow),
+            PermissionVerdict::Ask
+        );
+    }
+
+    /// Stepping over a leading redirect widens the allow side too: the command
+    /// behind it matches the rule that covers it. Deliberate and rule-faithful,
+    /// pinned here so it cannot change silently and so the boundary against a
+    /// real file target stays visible.
+    #[test]
+    fn test_leading_redirect_lets_an_allowed_command_be_allowed() {
+        let allow = vec!["git:*".to_string()];
+
+        for cmd in [
+            "2>&1 git status",
+            "2>/dev/null git status",
+            ">/dev/null git status",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &allow),
+                PermissionVerdict::Allow,
+                "fd-dup and /dev/null carry no data, so the command behind them \
+                 is the whole command: {cmd}"
+            );
+        }
+
+        // A real file target is still undecomposable, so it prompts.
+        assert_eq!(
+            check_command_with_rules(">out git status", &[], &[], &allow),
+            PermissionVerdict::Ask
+        );
+
+        // `<&N` and `<&-` duplicate a descriptor, so like `>&N` they carry no
+        // file target and need no prompt.
+        for cmd in ["<&0 git status", "0<&1 git status", "0<&- git status"] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &allow),
+                PermissionVerdict::Allow,
+                "a descriptor duplication is not a file target: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_brace_group_does_not_hide_a_denied_command() {
+        let deny = vec!["rm -rf /".to_string()];
+
+        for cmd in [
+            "git status && { rm -rf / ; }",
+            "git status && ! rm -rf /",
+            "{ rm -rf / ; }",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &[]),
+                PermissionVerdict::Deny,
+                "shell grammar in front of a command must not defeat a deny rule: {cmd}"
+            );
+        }
+    }
+
+    /// The class behind the cases above: a prefix built from redirects,
+    /// grouping, negation and separators does not change which command runs,
+    /// so none of them may hide it from a deny rule.
+    #[test]
+    fn test_no_prefix_construct_can_hide_a_denied_command() {
+        // Generated rather than listed, so no spacing variant depends on
+        // someone remembering to write it out.
+        const REDIRECTS: &[&str] = &[
+            "2>&1",
+            "1>&2",
+            ">&2",
+            "2>&-",
+            ">out",
+            ">>out",
+            "<in",
+            "2>/dev/null",
+            ">/dev/null",
+            ">$HOME/x",
+            "<&0",
+            // An explicit fd number belongs to the redirect, on both arms.
+            "0<&1",
+            "0<&-",
+            "3<&0",
+            "1<in",
+            "0</dev/null",
+            "0>&1",
+            "3>out",
+        ];
+        const SEPARATORS: &[&str] = &[
+            " ", "&", "&&", ";", "|", "||", "& ", "&& ", "; ", "| ", "|| ",
+        ];
+        // Not segment boundaries, so the command stays glued to them.
+        const GRAMMAR: &[&str] = &["{ ", "! ", "{ ! ", "! { ", "} "];
+
+        let mut prefixes = vec![String::new()];
+        for redirect in REDIRECTS {
+            for separator in SEPARATORS {
+                prefixes.push(format!("{redirect}{separator}"));
+                for grammar in GRAMMAR {
+                    prefixes.push(format!("{grammar}{redirect}{separator}"));
+                    prefixes.push(format!("ls && {grammar}{redirect}{separator}"));
+                }
+            }
+            // Two redirects glued with no separator between them.
+            for second in REDIRECTS {
+                prefixes.push(format!("{redirect}{second} "));
+            }
+        }
+        // A line continuation is elided by bash, joining the words either side.
+        for lead in ["", "ls && ", "ls; ", "ls | "] {
+            prefixes.push(format!("{lead}\\\n"));
+            prefixes.push(format!("{lead}\\\r\n"));
+        }
+        for grammar in GRAMMAR {
+            prefixes.push((*grammar).to_string());
+            prefixes.push(format!("ls && {grammar}"));
+        }
+        for lead in ["ls && ", "ls; ", "ls | ", "ls & "] {
+            prefixes.push(lead.to_string());
+        }
+
+        let deny = vec!["rm -rf /".to_string()];
+        for prefix in &prefixes {
+            let cmd = format!("{prefix}rm -rf /");
+            assert_eq!(
+                check_command_with_rules(&cmd, &deny, &[], &[]),
+                PermissionVerdict::Deny,
+                "prefix {prefix:?} hid the denied command: {cmd:?} segmented to {:?}",
+                split_compound_command(&cmd)
+            );
+        }
+        assert!(
+            prefixes.len() > 600,
+            "matrix collapsed to {}",
+            prefixes.len()
+        );
+    }
+
+    #[test]
+    fn test_grammar_residue_never_widens_allow() {
+        let allow = vec!["git:*".to_string()];
+
+        // One segment, so nothing else can hold Allow back: if the stripped
+        // form ever reaches the allow loop, this flips to Allow.
+        assert_eq!(
+            check_command_with_rules("! git status", &[], &[], &allow),
+            PermissionVerdict::Default,
+            "negation must not inherit the allow rule of the command it negates"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_shell_wrapper_candidate_never_auto_allowed() {
+        let allow = vec!["*".to_string()];
+        for command in ["bash -lc 'git status'", "bash -e -c 'git status'"] {
+            assert_eq!(
+                check_command_with_rules(command, &[], &[], &allow),
+                PermissionVerdict::Ask,
+                "unsupported command-string wrapper must ask: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shell_wrapper_inner_deny_defers_inside_outer_compound() {
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules(
+                "bash -c 'git status; rm -rf /tmp/example' && cargo test",
+                &deny,
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Defer
+        );
+    }
+
+    #[test]
+    fn test_prefixed_shell_wrapper_inner_deny_defers() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "env bash -c 'git push'",
+            "env FOO=1 bash -c 'git push'",
+            "FOO=1 bash -c 'git push'",
+            "timeout 5 bash -c 'git push'",
+            "nice -n 5 bash -c 'git push'",
+            "time bash -c 'git push'",
+            "nohup sh -c 'git push'",
+            "command bash -c 'git push'",
+            "exec bash -c 'git push'",
+            "uv run bash -c 'git push'",
+            "env FOO=1 timeout 5 bash -c 'git push'",
+            "env zsh -c 'git status; git push'",
+            "ls && env bash -c 'git push'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Defer,
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prefixed_shell_wrapper_keeps_the_outer_verdict() {
+        let allow = vec![
+            "env:*".to_string(),
+            "timeout:*".to_string(),
+            "git status:*".to_string(),
+        ];
+        for cmd in [
+            "env bash -c 'git status'",
+            "timeout 5 bash -c 'git status'",
+            "env bash -lc 'git status'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &allow),
+                PermissionVerdict::Allow,
+                "{cmd:?}"
+            );
+        }
+        assert_eq!(
+            check_command_with_rules("bash -c 'git status'", &[], &[], &allow),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn test_line_continuation_is_joined_before_the_wrapper_check() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "bash -c 'git \\\npush'",
+            "bash -c \\\n'git push'",
+            "bash \\\n-c 'git push'",
+            "env bash -c 'git \\\npush' && ls",
+            "timeout 5 bash -c 'git status; git \\\npush'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Defer,
+                "{cmd:?}"
+            );
+        }
+        assert_eq!(
+            check_command_with_rules(
+                "bash -c 'git status' && ls 'git\\\n status'",
+                &deny,
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn test_wrapper_reached_by_the_rewrite_is_gated_for_deny_rules() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        let ten = format!("{}bash -c 'git push'", "exec ".repeat(10));
+        let eleven = format!("{}bash -c 'git push'", "exec ".repeat(11));
+        for cmd in [
+            "FOO=a>/dev/null bash -c 'git push'",
+            "FOO=a&>/dev/null timeout 5 bash -c 'git push'",
+            "bash -c \\\n'git push'",
+            "bash \\\n-c 'git push'",
+            "timeout 5 \\\nbash -c 'git push'",
+            "true &&\\\nbash -c 'git push'",
+            "ls && FOO=a>/dev/null bash -c 'git push'",
+            ten.as_str(),
+        ] {
+            assert!(
+                registry::rewrite_command(cmd, &[], &[]).is_some(),
+                "{cmd:?}"
+            );
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Defer,
+                "{cmd:?}"
+            );
+        }
+        assert!(registry::rewrite_command(&eleven, &[], &[]).is_none());
+        assert_eq!(
+            check_command_with_rules(&eleven, &deny, &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_inner_deny_sees_past_a_prefix_inside_the_script() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "env bash -c 'exec git push'",
+            "env bash -c 'command git push'",
+            "env bash -c 'env git push'",
+            "env bash -c 'timeout 5 git push'",
+            "env bash -c 'FOO=1 git push'",
+            "env bash -c 'git status; ! exec git push'",
+            "bash -c 'exec git push'",
+            "bash -c 'nohup FOO=1 git push'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Defer,
+                "{cmd:?}"
+            );
+        }
+        for cmd in ["env bash -c 'echo git push'", "env bash -c 'git -C . push'"] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Allow,
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_untouched_prefixed_wrapper_keeps_the_outer_verdict() {
+        let deny = vec!["git push:*".to_string(), "rm:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            "uv run env  sh -ec \"git status\"",
+            "\tenv zsh -ec 'git status' && ls",
+            "( nice fish -lc '{ git status; }' && ls",
+            "time -p sh -lc \"command git push\" ; ls",
+            "env zsh -c '{ git status; }' && ls",
+            "uv run bash -c \"git status\" | grep -rn x src",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Allow,
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_transparent_prefix_wrapper_inner_deny_defers() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        let prefixes = vec!["direnv exec .".to_string()];
+        assert_eq!(
+            check_command_with_rules_and_prefixes(
+                "direnv exec . bash -c 'git push'",
+                &deny,
+                &[],
+                &allow,
+                &prefixes
+            ),
+            PermissionVerdict::Defer
+        );
+        assert_eq!(
+            check_command_with_rules_and_prefixes(
+                "direnv exec . bash -c 'git status'",
+                &[],
+                &[],
+                &allow,
+                &prefixes
+            ),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            check_command_with_rules("direnv exec . bash -c 'git push'", &deny, &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_shell_wrapper_word_as_argument_is_not_a_wrapper() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        for cmd in [
+            r#"git commit -m "bash -c 'git push'""#,
+            r#"git commit -m "/bin/sh -c 'git push' fix""#,
+            "grep -rn bash -c src",
+            "rg -t sh -c TODO src",
+            "git log --oneline sh -c",
+            "ssh host bash -c 'git status'",
+            "docker run img sh -c 'ls'",
+            r#"find . -name '*.rs' -exec sh -c 'wc -l "$1"' _ {} \;"#,
+            r"git status \# sh -c x",
+            "echo bash -c 'git push'",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &[], &allow),
+                PermissionVerdict::Allow,
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deny_rule_in_argument_text_keeps_the_chain_rewritable() {
+        let deny = vec!["rm:*".to_string()];
+        let cmd = "git status && grep sh -c 'rm' f";
+        assert_eq!(
+            check_command_with_rules(cmd, &deny, &[], &["*".to_string()]),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            check_command_with_rules(cmd, &deny, &[], &[]),
+            PermissionVerdict::Default
+        );
+    }
+
+    #[test]
+    fn test_wrapper_suffix_arguments_are_not_a_second_wrapper() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules(
+                "bash -c 'git status' -- sh -c 'git push'",
+                &deny,
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Ask
+        );
+    }
+
+    #[test]
+    fn test_commented_shell_wrapper_text_is_not_a_wrapper() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status # bash -c 'git push'", &deny, &[], &allow),
+            PermissionVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn test_unreadable_wrapper_does_not_hide_a_later_inner_deny() {
+        let deny = vec!["git push:*".to_string()];
+        let allow = vec!["*".to_string()];
+        assert_eq!(
+            check_command_with_rules(
+                r#"bash -c "$SCRIPT"; bash -c 'git push'"#,
+                &deny,
+                &[],
+                &allow
+            ),
+            PermissionVerdict::Defer
+        );
+        assert_eq!(
+            check_command_with_rules(r#"bash -c "$SCRIPT""#, &deny, &[], &allow),
+            PermissionVerdict::Ask
         );
     }
 }

@@ -51,10 +51,11 @@ tee_on_success = false      # tee mode: legacy `mode = "always"`, archive succes
 # tee_directory = "/custom/tee/dir"
 
 [telemetry]
-enabled = true              # anonymous daily ping — see Telemetry & Privacy for full details
+enabled = false             # opt-in anonymous daily ping (off by default) — see Telemetry & Privacy
 
 [hooks]
 exclude_commands = []       # commands to never auto-rewrite
+suppress_hook_warning = false # suppress the missing-hook warning only
 
 [awareness]
 level = "default"           # "default", "high", "full" — see Awareness level
@@ -70,7 +71,7 @@ For full details on what is collected, opt-out options, and GDPR rights, see [Te
 | Level | The agent is told | Pick it when |
 |-------|-------------------|--------------|
 | `default` | How to read condensed output. Nothing about RTK. | Hook-based agent, RTK stays invisible. |
-| `high` | `default` + what RTK is and `rtk gain`, `rtk proxy`, `RTK_DISABLED=1`, `rtk discover`. | You want to ask the agent about savings or to bypass RTK. |
+| `high` | `default` + what RTK is and `rtk gain`, `rtk bypass`, `RTK_DISABLED=1`, `rtk discover`. | You want to ask the agent about savings or to bypass RTK. |
 | `full` | `high` + "prefix every command with `rtk`". | Agent without a hook, or you want the agent to drive RTK itself. |
 
 ```toml
@@ -80,7 +81,7 @@ level = "high"
 
 Re-run `rtk init -g` (or your agent's init command) to rewrite the file.
 
-Agents without a hook (Codex CLI, Cline, Windsurf, Kilo Code, Antigravity, Kimi) always get `full`,
+Agents without a hook (Codex CLI, Cline, Windsurf, Kilo Code, Kimi) always get `full`,
 since the agent must type `rtk` itself. `rtk init` prints a note when it does this.
 
 ## Environment variables
@@ -94,6 +95,8 @@ since the agent must type `rtk` itself. `rtk init` prints a note when it does th
 | `RTK_TEE_DIR` | Override the tee directory (tee mode) |
 | `RTK_TELEMETRY_DISABLED=1` | Disable telemetry |
 | `RTK_HOOK_AUDIT=1` | Enable hook audit logging |
+| `RTK_SUPPRESS_HOOK_WARNING=1` | Suppress the missing-hook warning only (not the outdated-hook upgrade prompt); `true`, `yes`, `on` also accepted |
+| `RTK_SUPPRESS_HOOK_WARNING=0` | Force the missing-hook warning back on, overriding `hooks.suppress_hook_warning`; `false`, `no`, `off` also accepted |
 | `SKIP_ENV_VALIDATION=1` | Skip env validation (useful with Next.js) |
 
 ## Recall system
@@ -153,12 +156,12 @@ of it. Before matching, RTK peels those off the command and matches what is left
 alike; `"pytest"` also covers `python3 -m pytest tests/`, and `"phpunit"` covers
 `vendor/bin/phpunit` and `php vendor/bin/phpunit`.
 
-Three spellings are not peeled yet, and still rewrite despite a matching entry:
+Three spellings are not peeled, and still rewrite despite a matching entry:
 
 | Entry | Command | Why |
 |---|---|---|
-| `"head"`, `"tail"` | `head -20 f`, `tail -n 5 f` | The line-range form takes a fast path that returns before the exclusion is consulted ([#2823](https://github.com/rtk-ai/rtk/issues/2823)). Without a line range, `head f` is excluded normally. |
-| `"gradlew"`, `"mvn"` | `gradlew.bat build`, `mvnw.cmd test` | Path stripping splits on `/`, so a `.bat`/`.cmd` spelling never reduces to the tool name. `./gradlew` and `gradlew` are both excluded ([#3617](https://github.com/rtk-ai/rtk/pull/3617)). |
+| `"head"`, `"tail"` | `head -20 f`, `tail -n 5 f` | The line-range form takes a fast path that returns before the exclusion is consulted. Without a line range, `head f` is excluded normally. |
+| `"gradlew"`, `"mvn"` | `gradlew.bat build`, `mvnw.cmd test` | Path stripping splits on `/`, so a `.bat`/`.cmd` spelling never reduces to the tool name. `./gradlew` and `gradlew` are both excluded. |
 | `"golangci-lint"` | `golangci run ./...` | `golangci run` is one of the rule's own aliases and is kept whole, so it does not match the `golangci-lint` entry. Exclude `"golangci"` as well to cover it. |
 
 A tool RTK has no filter of its own for is matched as typed, because RTK only sees the wrapper:
@@ -188,19 +191,15 @@ RTK_DISABLED=1 git rebase main
 
 ## Telemetry
 
-RTK sends one anonymous ping per day (23h interval). No personal data, no file paths, no command content.
+Telemetry is **off by default** and only runs after you opt in — `rtk init` asks once (`[y/N]`, default no), or run `rtk telemetry enable`. Once enabled, RTK sends at most one anonymous ping per day. No personal data, no file paths, no command content.
 
 Data sent: device hash, version, OS, architecture, command count/24h, top commands, savings %.
 
-To opt out:
+To opt out again:
 
 ```bash
-# Via environment variable
-export RTK_TELEMETRY_DISABLED=1
-
-# Via config.toml
-[telemetry]
-enabled = false
+rtk telemetry disable              # withdraw consent
+export RTK_TELEMETRY_DISABLED=1    # block telemetry regardless of config
 ```
 
 ## Custom filters

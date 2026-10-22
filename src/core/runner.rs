@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::borrow::Cow;
 use std::process::Command;
 use std::sync::LazyLock;
 
@@ -9,17 +10,65 @@ use crate::core::stream::{self, FilterMode, StdinMode, StreamFilter};
 use crate::core::tracking;
 use crate::core::truncate::{CAP_LIST, CAP_WARNINGS};
 
-/// Compose `filtered` with an optional recovery `hint`, cap the total at `raw`
-/// (never emit more tokens than the command), print it, and return what was
-/// emitted so the caller tracks exactly that.
+/// Compose `filtered` with an optional recovery `hint` and print it, or print `raw`
+/// instead when the command's own output is estimated to cost fewer tokens. Both
+/// sides are weighed as printed, each under its terminator, and a tie goes to the
+/// composed form. Returns what was emitted so the caller tracks exactly that.
 pub fn emit_guarded(filtered: &str, hint: Option<&str>, raw: &str) -> String {
-    let body = match hint {
-        Some(h) => format!("{}\n{}", filtered, h),
-        None => filtered.to_string(),
-    };
-    let shown = crate::core::guard::never_worse(raw, &body).to_string();
-    println!("{}", shown);
+    emit(filtered, hint, raw, &[])
+}
+
+/// [`emit_guarded`], with the guard waived when `raw` is one of `clean_outputs`
+/// (see [`guard_stdout`]).
+fn emit(filtered: &str, hint: Option<&str>, raw: &str, clean_outputs: &[&str]) -> String {
+    let shown = guarded_output(filtered, hint, raw, clean_outputs);
+    print!("{}", shown);
     shown
+}
+
+/// The exact bytes `emit` writes: the guarded body, terminated.
+///
+/// Filters disagree on whether their last line already carries its terminator,
+/// so it is supplied rather than assumed. Supplying one unconditionally costs a
+/// byte the command never emitted whenever the body ends in a newline of its
+/// own -- the shape every guard fallback takes, a command's output being
+/// newline-terminated in the ordinary case. A command whose own output is
+/// unterminated still gets the one newline a printed line needs; that byte is
+/// the price of not gluing the next prompt to the output.
+///
+/// A body that is the empty string prints nothing at all. A filter with nothing
+/// to report, like a command with nothing to say, should not cost a blank line.
+fn guarded_output(filtered: &str, hint: Option<&str>, raw: &str, clean_outputs: &[&str]) -> String {
+    let body = with_hint(filtered, hint);
+    // Both sides weighed as they will be printed. The printer's terminator is paid by
+    // whichever form wins, so charging it to one side only decides close calls on a
+    // byte that is not the difference between them.
+    let body = terminated(&body);
+    let raw = terminated(raw);
+    guard_stdout(&raw, &body, clean_outputs).to_string()
+}
+
+/// `filtered` followed by the recovery `hint`, as [`emit_guarded`] composes them.
+///
+/// The hint goes on the line after the filtered text, whose own terminator is
+/// reused rather than doubled; with no filtered text, the hint is the whole body.
+pub fn with_hint<'a>(filtered: &'a str, hint: Option<&str>) -> Cow<'a, str> {
+    match hint {
+        Some(h) => Cow::Owned(format!("{}{}", terminated(filtered), h)),
+        None => Cow::Borrowed(filtered),
+    }
+}
+
+/// `text` under a trailing newline, and none at all when it is empty.
+///
+/// Only ever adds the missing one: a text that ends in a blank line keeps it,
+/// since the blank line is the command's output and not a stray terminator.
+fn terminated(text: &str) -> Cow<'_, str> {
+    if text.is_empty() || text.ends_with('\n') {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{}\n", text))
+    }
 }
 
 pub fn print_with_hint(
@@ -33,6 +82,127 @@ pub fn print_with_hint(
     emit_guarded(filtered, hint.as_deref(), guard_raw)
 }
 
+#[cfg(test)]
+mod guarded_output_tests {
+    use super::*;
+
+    const HINT: &str = "[full output: ~/.local/share/rtk/tee/1_go_test.log]";
+
+    /// Long enough that the guard keeps the filtered form, so a test about the
+    /// terminator is not really a test about the fallback.
+    fn bulky_raw() -> String {
+        "go: downloading example.com/module v1.2.3\n".repeat(20)
+    }
+
+    /// The guard hands back the command's own output when the filtered form would cost
+    /// more, and that output is already newline-terminated: terminating it again is a
+    /// byte the command never emitted.
+    #[test]
+    fn terminated_fallback_costs_exactly_the_command() {
+        for raw in ["ok\n", "ok  ex\n", "PASS\n", "a\nb\n"] {
+            let out = guarded_output(
+                "a summary longer than the output it summarises",
+                None,
+                raw,
+                &[],
+            );
+            assert_eq!(out, raw, "guard fallback must emit the raw bytes unchanged");
+        }
+    }
+
+    /// Most filters leave their last line unterminated and count on the printer for it.
+    #[test]
+    fn unterminated_body_gains_one_newline() {
+        assert_eq!(
+            guarded_output("3 passed", None, &bulky_raw(), &[]),
+            "3 passed\n"
+        );
+    }
+
+    #[test]
+    fn hint_is_terminated_once() {
+        let out = guarded_output("3 passed", Some(HINT), &bulky_raw(), &[]);
+        assert_eq!(out, format!("3 passed\n{}\n", HINT));
+    }
+
+    #[test]
+    fn already_terminated_hint_gains_nothing() {
+        let out = guarded_output("3 passed", Some(&format!("{}\n", HINT)), &bulky_raw(), &[]);
+        assert_eq!(out, format!("3 passed\n{}\n", HINT));
+    }
+
+    /// A filtered text that brings its own terminator is not given a blank line
+    /// before the hint.
+    #[test]
+    fn terminated_body_and_hint_gain_no_blank_line() {
+        let out = guarded_output("3 passed\n", Some(HINT), &bulky_raw(), &[]);
+        assert_eq!(out, format!("3 passed\n{}\n", HINT));
+    }
+
+    /// The join itself, on every shape a filtered text and a hint come in.
+    #[test]
+    fn with_hint_joins_on_the_next_line() {
+        assert_eq!(
+            with_hint("3 passed\n", Some(HINT)),
+            format!("3 passed\n{}", HINT)
+        );
+        assert_eq!(
+            with_hint("3 passed", Some(HINT)),
+            format!("3 passed\n{}", HINT)
+        );
+        assert_eq!(with_hint("", Some(HINT)), HINT);
+        assert_eq!(with_hint("3 passed", None), "3 passed");
+        assert_eq!(with_hint("3 passed\n", None), "3 passed\n");
+    }
+
+    /// With nothing filtered to show, the hint alone is printed, without a blank line
+    /// above it.
+    #[test]
+    fn empty_body_with_hint_prints_the_hint_alone() {
+        let out = guarded_output("", Some(HINT), &bulky_raw(), &[]);
+        assert_eq!(out, format!("{}\n", HINT));
+    }
+
+    /// A body that ties with the command's output only because its terminator has not
+    /// been added yet outgrows that output the moment it is printed.
+    #[test]
+    fn the_terminator_counts_toward_the_guard() {
+        assert_eq!(
+            guarded_output("abcdefgh", None, "abc\ndef\n", &[]),
+            "abc\ndef\n"
+        );
+    }
+
+    /// The other side of the same scale: a command that left its own output unterminated
+    /// owes the printer the same byte, so it must not win a tie the filtered form loses
+    /// only for having been charged it alone.
+    #[test]
+    fn an_unterminated_raw_is_weighed_terminated_too() {
+        assert_eq!(
+            guarded_output("abcdefgh", None, "12345678", &[]),
+            "abcdefgh\n"
+        );
+    }
+
+    /// The empty form of a format rtk injected, like ruff's `[]`, is not what the user
+    /// asked for: the summary replaces it, terminated once.
+    #[test]
+    fn an_injected_clean_output_shows_the_summary_terminated() {
+        let summary = "Ruff: No issues found";
+        assert_eq!(
+            guarded_output(summary, None, "[]\n", &["[]"]),
+            format!("{}\n", summary)
+        );
+    }
+
+    /// A command that printed nothing must not gain a blank line.
+    #[test]
+    fn empty_stays_empty() {
+        assert_eq!(guarded_output("", None, "", &[]), "");
+        assert_eq!(guarded_output("", None, &bulky_raw(), &[]), "");
+    }
+}
+
 #[derive(Default)]
 pub struct RunOptions<'a> {
     pub tee_label: Option<&'a str>,
@@ -43,6 +213,9 @@ pub struct RunOptions<'a> {
     /// can read from a pipe (e.g. `cat file | rtk wc`); without it the child
     /// gets an empty stdin and reports zero.
     pub inherit_stdin: bool,
+    /// What the tool prints on a clean run in the output format rtk injected, e.g. ruff's
+    /// `[]`. See [`guard_stdout`]. Not consulted when `tee_label` is set.
+    pub clean_outputs: &'a [&'a str],
 }
 
 impl<'a> RunOptions<'a> {
@@ -78,6 +251,23 @@ impl<'a> RunOptions<'a> {
     pub fn inherit_stdin(mut self) -> Self {
         self.inherit_stdin = true;
         self
+    }
+
+    pub fn clean_outputs(mut self, outputs: &'a [&'a str]) -> Self {
+        self.clean_outputs = outputs;
+        self
+    }
+}
+
+/// The stdout to show: `filtered`, unless it costs more tokens than `raw`.
+///
+/// A `raw` that is exactly one of `clean_outputs` is the empty form of a format rtk injected,
+/// not output the user asked for, so the filter's summary is shown even though it is longer.
+fn guard_stdout<'a>(raw: &'a str, filtered: &'a str, clean_outputs: &[&str]) -> &'a str {
+    if clean_outputs.contains(&raw.trim()) {
+        filtered
+    } else {
+        crate::core::guard::never_worse(raw, filtered)
     }
 }
 
@@ -138,25 +328,114 @@ where
         raw
     };
 
+    // The guard governs the stdout rtk replaces. stderr is forwarded separately below, and
+    // only ever shrinks there, so it cannot push the total past what the command emitted.
     let shown = if let Some(label) = opts.tee_label {
         print_with_hint(&filtered, raw, raw_for_tracking, label, exit_code)
-    } else {
-        let guarded = crate::core::guard::never_worse(raw_for_tracking, &filtered).to_string();
-        if opts.no_trailing_newline {
-            print!("{}", guarded);
-        } else {
-            println!("{}", guarded);
-        }
+    } else if opts.no_trailing_newline {
+        // The filters that opt out own their line endings: what they return is already
+        // exactly what the command would have printed, terminator included.
+        let guarded = guard_stdout(raw_for_tracking, &filtered, opts.clean_outputs).to_string();
+        print!("{}", guarded);
         guarded
+    } else {
+        emit(&filtered, None, raw_for_tracking, opts.clean_outputs)
     };
 
-    timer.track(
-        cmd_label,
-        &format!("rtk {}", cmd_label),
-        raw_for_tracking,
-        &shown,
-    );
+    // Stdout-only filters parse structured stdout; stderr still carries diagnostics
+    // (config errors, missing linters) that the user needs.
+    let forwarded = (opts.filter_stdout_only && !result.raw_stderr.trim().is_empty()).then(|| {
+        forwarded_stderr(&result.raw_stderr, exit_code, &shown, |stderr| {
+            crate::core::tee::force_tee_hint(
+                stderr,
+                &format!("{}-stderr", opts.tee_label.unwrap_or(tool_name)),
+            )
+        })
+    });
+    if let Some(text) = &forwarded {
+        eprint!("{}", text);
+    }
+
+    // Forwarded stderr reaches the user just as much as stdout does, so counting only
+    // stdout would book a passed-through stream as if the filter had removed it.
+    let emitted = match &forwarded {
+        Some(text) => Cow::Owned(format!("{}{}", shown, text)),
+        None => Cow::Borrowed(shown.as_str()),
+    };
+    timer.track(cmd_label, &format!("rtk {}", cmd_label), raw, &emitted);
     Ok(exit_code)
+}
+
+/// How many stderr lines survive the cap. Warning-shaped data, so the warnings cap.
+const MAX_FORWARDED_STDERR_LINES: usize = CAP_WARNINGS;
+
+/// The stderr a stdout-only filter forwards.
+///
+/// Whole, whenever stderr is the report: the command failed, or the filter had nothing to show
+/// for stdout. Those are the cases stderr forwarding exists for -- a golangci-lint config
+/// error leaves stdout empty, and dropping its stderr left the user with no output at all.
+///
+/// Capped otherwise, because on a run that succeeded and reported on stdout, stderr is as
+/// often progress chatter -- `go: downloading …` once per module on a cold cache -- and
+/// forwarding all of it verbatim leaves rtk emitting as much as the command it stands in
+/// front of.
+///
+/// The cap keeps the END. A tool resolves and downloads before it builds, so its chatter comes
+/// first and anything it has to say -- a deprecation warning, "matched no packages" -- comes
+/// after: a cap on the head keeps the noise and drops exactly the lines worth forwarding.
+///
+/// Three things make it give up and forward the lot. A stderr below the recovery store's own
+/// floor, which is not worth a stored file and the eviction that comes with it. `recovery_hint`
+/// returning `None`, meaning there is no store to point at, and a count of lines nobody can
+/// read is worse than the lines (`curl_cmd` declines the same way). And a result that is not
+/// actually smaller, since the note and the hint cost bytes of their own -- rtk emits no more
+/// than the command it stands in front of, on either stream.
+fn forwarded_stderr<'a>(
+    stderr: &'a str,
+    exit_code: i32,
+    shown_stdout: &str,
+    recovery_hint: impl FnOnce(&str) -> Option<String>,
+) -> Cow<'a, str> {
+    if exit_code != 0 || shown_stdout.trim().is_empty() {
+        return Cow::Borrowed(stderr);
+    }
+    // Below the recovery store's own floor there is nothing to gain and a file to write for
+    // it: the store would hold a stderr smaller than the note and hint that point at it, and
+    // every write evicts an older entry. `tsc_cmd` declines on the same threshold.
+    if stderr.len() < crate::core::tee::MIN_TEE_SIZE {
+        return Cow::Borrowed(stderr);
+    }
+    let Some((offset, held_back)) = last_lines_offset(stderr, MAX_FORWARDED_STDERR_LINES) else {
+        return Cow::Borrowed(stderr);
+    };
+    let Some(hint) = recovery_hint(stderr) else {
+        return Cow::Borrowed(stderr);
+    };
+    let capped = format!(
+        "... (+{} earlier stderr {} not shown)\n{}{}\n",
+        held_back,
+        if held_back == 1 { "line" } else { "lines" },
+        &stderr[offset..],
+        hint
+    );
+    if capped.len() >= stderr.len() {
+        return Cow::Borrowed(stderr);
+    }
+    Cow::Owned(capped)
+}
+
+/// Where `text`'s last `n` lines begin, as a byte offset, and how many lines that skips.
+/// `None` when it has no more than `n`.
+///
+/// A byte offset rather than `lines().collect()` and a re-join: `str::lines` drops the `\r` of
+/// a CRLF ending and nothing puts it back, so re-joining would rewrite the line endings of a
+/// stderr that happened to be long enough to cap. It also reads none of the lines it skips.
+/// `\n` is ASCII, so the offset is always a char boundary.
+fn last_lines_offset(text: &str, n: usize) -> Option<(usize, usize)> {
+    let skipped = text.lines().count().checked_sub(n).filter(|&s| s > 0)?;
+    text.match_indices('\n')
+        .nth(skipped - 1)
+        .map(|(index, _)| (index + 1, skipped))
 }
 
 pub fn run(
@@ -180,7 +459,7 @@ fn run_inner(
     opts: RunOptions<'_>,
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
-    let cmd_label = format!("{} {}", tool_name, args_display);
+    let cmd_label = crate::core::shell::with_args(tool_name, args_display);
 
     match mode {
         RunMode::Filtered(filter_fn) => run_captured_filter(
@@ -204,12 +483,11 @@ fn run_inner(
                 stream::run_streaming(&mut cmd, StdinMode::Null, FilterMode::Streaming(filter))
                     .with_context(|| format!("Failed to run {}", tool_name))?;
 
-            if let Some(label) = opts.tee_label {
-                if let Some(hint) =
+            if let Some(label) = opts.tee_label
+                && let Some(hint) =
                     crate::core::tee::tee_and_hint(&result.raw, label, result.exit_code)
-                {
-                    println!("{}", hint);
-                }
+            {
+                println!("{}", hint);
             }
 
             timer.track(
@@ -225,7 +503,7 @@ fn run_inner(
                 stream::run_streaming(&mut cmd, StdinMode::Inherit, FilterMode::Passthrough)
                     .with_context(|| format!("Failed to run {}", tool_name))?;
 
-            timer.track_passthrough(&cmd_label, &format!("rtk {} (passthrough)", cmd_label));
+            timer.track_passthrough(&cmd_label, &tracking::passthrough_label(&cmd_label));
             Ok(result.exit_code)
         }
     }
@@ -274,7 +552,7 @@ pub fn run_passthrough(tool: &str, args: &[std::ffi::OsString], verbose: u8) -> 
         eprintln!("{} passthrough: {:?}", tool, args);
     }
     let mut cmd = crate::core::utils::resolved_command(tool);
-    cmd.args(args);
+    crate::core::utils::ChildArgExt::child_args(&mut cmd, args);
     let args_str = tracking::args_display(args);
     run(
         cmd,
@@ -422,6 +700,63 @@ pub fn run_err_cmd(
         Box::new(ErrorStreamFilter::new()),
         RunOptions::with_tee(tee_label),
     )
+}
+
+/// Render a program that could not be run through the err filter's own failure
+/// path.
+///
+/// The interposed shell used to produce this: `[FAIL] Command failed (exit
+/// code: 127)` over its `command not found` line, or 126 over `Permission
+/// denied`. Direct execution answers for the program itself, so RTK renders it
+/// instead of bailing out with an `anyhow` chain on stderr.
+pub fn run_err_unrunnable(
+    tool: &str,
+    display: &str,
+    outcome: &crate::core::shell::Unrunnable,
+    verbose: u8,
+) -> i32 {
+    report_unrunnable(tool, display, outcome, verbose, |raw, code| {
+        ErrorStreamFilter::new()
+            .on_exit(code, raw)
+            .unwrap_or_default()
+    })
+}
+
+/// [`run_err_unrunnable`] for the test runner, rendered by the test summarizer.
+pub fn run_test_unrunnable(
+    tool: &str,
+    display: &str,
+    outcome: &crate::core::shell::Unrunnable,
+    eco: TestEcosystem,
+    verbose: u8,
+) -> i32 {
+    report_unrunnable(tool, display, outcome, verbose, |raw, _| {
+        extract_test_summary(raw, eco)
+    })
+}
+
+fn report_unrunnable(
+    tool: &str,
+    display: &str,
+    outcome: &crate::core::shell::Unrunnable,
+    verbose: u8,
+    render: impl FnOnce(&str, i32) -> String,
+) -> i32 {
+    if verbose > 0 {
+        eprintln!("Running: {}", display);
+    }
+    let timer = tracking::TimedExecution::start();
+    let rendered = render(&outcome.message, outcome.code);
+    println!("{}", rendered.trim_end());
+
+    let label = format!("{} {}", tool, display);
+    timer.track(
+        &label,
+        &format!("rtk {}", label),
+        &outcome.message,
+        &rendered,
+    );
+    outcome.code
 }
 
 /// Test-output ecosystem, chosen once at the boundary. Modules that know
@@ -643,7 +978,7 @@ const BUN_POLICY: BlockPolicy = BlockPolicy {
     },
 };
 
-/// Deno's type-check diagnostics, "TS2322 [ERROR]: Type 'string' is not
+/// Deno's type-check diagnostics, "TS2322 `[ERROR]`: Type 'string' is not
 /// assignable to type 'number'." They are not introduced by an `error:` line and
 /// carry no ERRORS section, so nothing else in the deno policy would keep them.
 static DENO_TS_ERROR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^TS\d+ \[ERROR\]:").unwrap());
@@ -899,6 +1234,204 @@ fn is_bun_count_line(trimmed: &str) -> bool {
         (Some(count), Some("pass" | "fail" | "skip" | "todo" | "error"), None)
             if count.chars().all(|c| c.is_ascii_digit())
     )
+}
+
+#[cfg(test)]
+mod guard_stdout_tests {
+    use super::*;
+
+    const SUMMARY: &str = "Ruff: No issues found";
+
+    #[test]
+    fn an_injected_clean_output_shows_the_summary() {
+        assert_eq!(guard_stdout("[]\n", SUMMARY, &["[]"]), SUMMARY);
+        assert_eq!(guard_stdout("[]\r\n", SUMMARY, &["[]"]), SUMMARY);
+    }
+
+    #[test]
+    fn any_other_short_output_still_goes_through_never_worse() {
+        assert_eq!(guard_stdout("{}\n", SUMMARY, &["[]"]), "{}\n");
+        assert_eq!(guard_stdout("[ ]\n", SUMMARY, &["[]"]), "[ ]\n");
+        assert_eq!(guard_stdout("[]\n", SUMMARY, &[]), "[]\n");
+    }
+}
+
+#[cfg(test)]
+mod forwarded_stderr_tests {
+    use super::*;
+
+    const HINT: &str = "[full output: ~/.local/share/rtk/tee/1_go_test-stderr.log]";
+
+    fn forward(stderr: &str, exit_code: i32, shown: &str) -> String {
+        forwarded_stderr(stderr, exit_code, shown, |_| Some(HINT.to_string())).into_owned()
+    }
+
+    fn chatter(lines: usize) -> String {
+        (0..lines)
+            .map(|i| format!("go: downloading example.com/module-{i} v1.2.3\n"))
+            .collect()
+    }
+
+    /// Long enough to clear the recovery store's floor, so a test about the cap is about the
+    /// cap rather than about that threshold.
+    fn over_the_floor(lines: usize) -> String {
+        let raw = chatter(lines);
+        assert!(raw.len() >= crate::core::tee::MIN_TEE_SIZE, "{lines} lines");
+        raw
+    }
+
+    #[test]
+    fn a_successful_run_with_output_keeps_the_end_of_stderr() {
+        // The signal in a chatty stderr sits after the chatter: resolution and downloads come
+        // first, and what the tool has to say comes last.
+        let mut raw = over_the_floor(150);
+        raw.push_str("go: warning: \"./...\" matched no packages\n");
+        raw.push_str("go: WARNING: module example.com/legacy is deprecated\n");
+
+        let out = forward(&raw, 0, "ok  example.com/pkg  0.012s");
+        assert!(out.contains("matched no packages"), "{out}");
+        assert!(out.contains("is deprecated"), "{out}");
+        assert!(
+            out.starts_with("... (+142 earlier stderr lines not shown)\n"),
+            "the elision note comes before what it stands for: {out}"
+        );
+        assert!(
+            out.contains(HINT),
+            "the held-back lines must stay reachable: {out}"
+        );
+        assert_eq!(
+            out.lines().count(),
+            MAX_FORWARDED_STDERR_LINES + 2,
+            "note, kept lines, hint: {out}"
+        );
+        assert!(out.len() < raw.len() / 2, "the cap must actually compress");
+    }
+
+    #[test]
+    fn a_failing_run_forwards_stderr_whole() {
+        let raw = over_the_floor(150);
+        assert_eq!(forward(&raw, 1, "some stdout"), raw);
+    }
+
+    #[test]
+    fn an_empty_filtered_stdout_forwards_stderr_whole() {
+        // golangci-lint's config errors land here: stdout is empty, so stderr IS the report.
+        let raw = over_the_floor(150);
+        assert_eq!(forward(&raw, 0, ""), raw);
+        assert_eq!(forward(&raw, 0, "   \n"), raw);
+    }
+
+    #[test]
+    fn a_short_stderr_is_forwarded_whole() {
+        let raw = chatter(MAX_FORWARDED_STDERR_LINES);
+        assert_eq!(forward(&raw, 0, "stdout"), raw);
+        let one = "one warning\n";
+        assert_eq!(forward(one, 0, "stdout"), one);
+        assert_eq!(forward("", 0, "stdout"), "");
+    }
+
+    /// Under the recovery store's floor nothing is stored and nothing is capped, however many
+    /// lines it runs to.
+    #[test]
+    fn a_stderr_under_the_recovery_floor_is_forwarded_whole() {
+        let raw: String = (0..40).map(|i| format!("w{i}\n")).collect();
+        assert!(raw.len() < crate::core::tee::MIN_TEE_SIZE);
+        let mut asked = false;
+        let out = forwarded_stderr(&raw, 0, "stdout", |_| {
+            asked = true;
+            Some(HINT.to_string())
+        });
+        assert_eq!(out, raw);
+        assert!(!asked, "nothing may be written to the store for it");
+    }
+
+    /// A note and a hint cost bytes of their own. On a stderr just over the line cap they cost
+    /// more than the lines they replace, and rtk would emit more than the command it replaces.
+    #[test]
+    fn a_cap_that_would_not_shrink_the_output_is_not_applied() {
+        for lines in (MAX_FORWARDED_STDERR_LINES + 1)..=30 {
+            let raw: String = (0..lines).map(|i| format!("w{i}\n")).collect();
+            let out = forward(&raw, 0, "stdout");
+            assert!(
+                out.len() <= raw.len(),
+                "{lines} short lines: rtk emitted {} bytes for {} of stderr",
+                out.len(),
+                raw.len()
+            );
+        }
+        // And it still caps once the lines are worth removing.
+        let raw = over_the_floor(40);
+        assert!(forward(&raw, 0, "stdout").len() < raw.len());
+    }
+
+    /// No recovery store means no way to read what the cap held back, and a count of
+    /// unreachable lines is worse than the lines.
+    #[test]
+    fn without_a_recovery_hint_stderr_is_forwarded_whole() {
+        let raw = over_the_floor(150);
+        assert_eq!(
+            forwarded_stderr(&raw, 0, "stdout", |_| None).into_owned(),
+            raw
+        );
+    }
+
+    #[test]
+    fn the_note_is_singular_for_one_held_back_line() {
+        let mut raw = chatter(MAX_FORWARDED_STDERR_LINES + 1);
+        raw.push_str(&"go: a long trailing warning that makes the cap worth applying\n".repeat(4));
+        let out = forward(&raw, 0, "stdout");
+        assert!(
+            out.contains("... (+5 earlier stderr lines not shown)"),
+            "{out}"
+        );
+
+        let raw = chatter(MAX_FORWARDED_STDERR_LINES).replace("module-0 v1.2.3", &"x".repeat(400))
+            + "go: one more\n";
+        let out = forward(&raw, 0, "stdout");
+        assert!(
+            out.contains("... (+1 earlier stderr line not shown)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn capping_does_not_rewrite_crlf_line_endings() {
+        // `str::lines()` drops the `\r` and nothing puts it back, so a re-joined cap would
+        // change line endings for exactly the stderr that was long enough to cap.
+        let raw: String = (0..60)
+            .map(|i| format!("line {i} with enough text to make capping worthwhile\r\n"))
+            .collect();
+        let out = forward(&raw, 0, "stdout");
+        assert_eq!(
+            out.matches('\r').count(),
+            MAX_FORWARDED_STDERR_LINES,
+            "every forwarded line must keep its CRLF: {out:?}"
+        );
+    }
+
+    #[test]
+    fn last_lines_offset_slices_on_a_line_boundary() {
+        assert_eq!(last_lines_offset("a\nb\nc\n", 1), Some((4, 2)));
+        assert_eq!(&"a\nb\nc\n"[4..], "c\n");
+        // An unterminated last line is still a line.
+        assert_eq!(last_lines_offset("a\nb\nc", 1), Some((4, 2)));
+        assert_eq!(&"a\nb\nc"[4..], "c");
+        // Nothing to skip.
+        assert_eq!(last_lines_offset("a\nb\n", 2), None);
+        assert_eq!(last_lines_offset("a\nb\n", 5), None);
+        assert_eq!(last_lines_offset("", 1), None);
+    }
+
+    /// `\n` is ASCII, so the offset lands on a char boundary whatever the bytes around it.
+    #[test]
+    fn a_non_ascii_stderr_is_sliced_without_panicking() {
+        let raw: String = (0..60)
+            .map(|i| format!("警告 {i}: «déprécié» 🎌 with enough text to be worth capping\n"))
+            .collect();
+        let out = forward(&raw, 0, "stdout");
+        assert!(out.contains("警告 59"), "{out}");
+        assert!(out.len() < raw.len());
+    }
 }
 
 #[cfg(test)]
